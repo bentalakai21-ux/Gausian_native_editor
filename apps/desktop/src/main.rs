@@ -529,13 +529,19 @@ impl App {
                 
                 if let Some((fmt, y, uv)) = yuv_result {
                     let use_uint = matches!(fmt, YuvPixFmt::P010) && !device_supports_16bit_norm(&rs);
+                    let (tex_w, tex_h) = if zc_opt.is_some() {
+                        let z = zc_opt.as_ref().unwrap();
+                        (z.width, z.height)
+                    } else {
+                        (self.y_size.0, self.y_size.1)
+                    };
                     let cb = egui_wgpu::Callback::new_paint_callback(
                         rect,
-                        PreviewYuvCallback { y_tex: y, uv_tex: uv, fmt, use_uint },
+                        PreviewYuvCallback { y_tex: y, uv_tex: uv, fmt, use_uint, w: tex_w, h: tex_h },
                     );
                     ui.painter().add(cb);
                     self.decode_mgr.increment_draws(&src.path);
-                    
+
                     // Show HUD overlay on successful draw
                     let hud = self.decode_mgr.hud(&src.path, t_sec as f64);
                     painter.text(rect.left_top() + egui::vec2(5.0, 5.0), egui::Align2::LEFT_TOP, hud, egui::FontId::monospace(10.0), egui::Color32::WHITE);
@@ -1513,6 +1519,8 @@ struct PreviewYuvCallback {
     uv_tex: Arc<eframe::wgpu::Texture>,
     fmt: YuvPixFmt,
     use_uint: bool,
+    w: u32,
+    h: u32,
 }
 
 struct Nv12Resources {
@@ -1522,7 +1530,11 @@ struct Nv12Resources {
     sampler: eframe::wgpu::Sampler,
 }
 
-struct Nv12BindGroup(eframe::wgpu::BindGroup);
+struct Nv12BindGroup {
+    bind: eframe::wgpu::BindGroup,
+    y_id: usize,
+    uv_id: usize,
+}
 struct P010UintResources {
     pipeline: eframe::wgpu::RenderPipeline,
     tex_bgl: eframe::wgpu::BindGroupLayout,
@@ -1718,14 +1730,20 @@ impl egui_wgpu::CallbackTrait for PreviewYuvCallback {
         }
 
         // Float NV12/P010 bind groups and uniform
-        let view_y = self.y_tex.create_view(&eframe::wgpu::TextureViewDescriptor::default());
-        let view_uv = self.uv_tex.create_view(&eframe::wgpu::TextureViewDescriptor::default());
-        let (nv_bgl, nv_samp) = {
-            let r = resources.get::<Nv12Resources>().unwrap();
-            (&r.bind_group_layout, &r.sampler)
-        };
-        let bind = device.create_bind_group(&eframe::wgpu::BindGroupDescriptor { label: Some("preview_nv12_bg"), layout: nv_bgl, entries: &[eframe::wgpu::BindGroupEntry { binding: 0, resource: eframe::wgpu::BindingResource::Sampler(nv_samp) }, eframe::wgpu::BindGroupEntry { binding: 1, resource: eframe::wgpu::BindingResource::TextureView(&view_y) }, eframe::wgpu::BindGroupEntry { binding: 2, resource: eframe::wgpu::BindingResource::TextureView(&view_uv) }] });
-        resources.insert(Nv12BindGroup(bind));
+        let y_id = Arc::as_ptr(&self.y_tex) as usize;
+        let uv_id = Arc::as_ptr(&self.uv_tex) as usize;
+        let rebuild = resources.get::<Nv12BindGroup>().map_or(true, |bg| bg.y_id != y_id || bg.uv_id != uv_id);
+        if rebuild {
+            let view_y = self.y_tex.create_view(&eframe::wgpu::TextureViewDescriptor::default());
+            let view_uv = self.uv_tex.create_view(&eframe::wgpu::TextureViewDescriptor::default());
+            let (nv_bgl, nv_samp) = {
+                let r = resources.get::<Nv12Resources>().unwrap();
+                (&r.bind_group_layout, &r.sampler)
+            };
+            let bind = device.create_bind_group(&eframe::wgpu::BindGroupDescriptor { label: Some("preview_nv12_bg"), layout: nv_bgl, entries: &[eframe::wgpu::BindGroupEntry { binding: 0, resource: eframe::wgpu::BindingResource::Sampler(nv_samp) }, eframe::wgpu::BindGroupEntry { binding: 1, resource: eframe::wgpu::BindingResource::TextureView(&view_y) }, eframe::wgpu::BindGroupEntry { binding: 2, resource: eframe::wgpu::BindingResource::TextureView(&view_uv) }] });
+            eprintln!("NV12 bind-group ready ({}x{} / {}x{})", self.w, self.h, (self.w + 1)/2, (self.h + 1)/2);
+            resources.insert(Nv12BindGroup { bind, y_id, uv_id });
+        }
         // Use limited-range conversion (FFmpeg typically outputs limited-range YUV)
         // Limited-range: Y 16-235, UV 16-240 (8-bit) or Y 64-940, UV 64-960 (10-bit)
         let (y_off, y_scale, c_off, c_scale) = match self.fmt { 
@@ -1764,7 +1782,7 @@ impl egui_wgpu::CallbackTrait for PreviewYuvCallback {
             let bg = resources.get::<Nv12BindGroup>().expect("nv12 bind group");
             let ubg = resources.get::<ConvBindGroup>().expect("conv bind group");
             render_pass.set_pipeline(&res.pipeline);
-            render_pass.set_bind_group(0, &bg.0, &[]);
+            render_pass.set_bind_group(0, &bg.bind, &[]);
             render_pass.set_bind_group(1, &ubg.0, &[]);
             render_pass.draw(0..3, 0..1);
         }

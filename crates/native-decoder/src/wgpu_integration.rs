@@ -10,7 +10,9 @@ use std::sync::Arc;
 
 #[cfg(target_os = "macos")]
 use wgpu::*;
+#[cfg(target_os = "macos")]
 use std::slice;
+#[cfg(target_os = "macos")]
 use core_foundation::base::TCFType;
 
 #[cfg(target_os = "macos")]
@@ -23,9 +25,11 @@ extern "C" {
     fn avf_iosurface_base_address_of_plane(s: *mut std::ffi::c_void, plane: usize) -> *const std::ffi::c_void;
 }
 
+#[cfg(target_os = "macos")]
 #[inline]
 fn align_up(x: u32, align: u32) -> u32 { (x + align - 1) & !(align - 1) }
-use tracing::debug;
+#[cfg(target_os = "macos")]
+use tracing::info;
 
 /// WGPU external texture for IOSurface integration
 #[cfg(target_os = "macos")]
@@ -86,7 +90,7 @@ impl IOSurfaceTexture {
         // 3. Unlock the IOSurface
         
         // For now, this is a placeholder
-        debug!("Updating IOSurface texture with new frame data");
+        info!("Updating IOSurface texture with new frame data");
         Ok(())
     }
 
@@ -132,7 +136,7 @@ impl GpuYuv {
         let src_bpr1 = unsafe { avf_iosurface_bytes_per_row_of_plane(s_ref, 1) } as u32;
         let base1 = unsafe { avf_iosurface_base_address_of_plane(s_ref, 1) } as *const u8;
 
-        debug!("IOSurface planes: Y {}x{} bpr={} | UV {}x{} bpr={}", w0, h0, src_bpr0, w1, h1, src_bpr1);
+        info!("IOSurface planes: Y {}x{} bpr={} | UV {}x{} bpr={}", w0, h0, src_bpr0, w1, h1, src_bpr1);
 
         // Convert base addresses to slices
         let y_src = unsafe { slice::from_raw_parts(base0, (src_bpr0 * h0) as usize) };
@@ -162,7 +166,7 @@ impl GpuYuv {
                 .copy_from_slice(&uv_src[src_off as usize .. (src_off + row_bytes_uv) as usize]);
         }
 
-        debug!("NV12 repack: Y dst_bpr={} UV dst_bpr={}", dst_bpr0, dst_bpr1);
+        info!("NV12 repack: Y dst_bpr={} UV dst_bpr={}", dst_bpr0, dst_bpr1);
 
         // Upload Y
         queue.write_texture(
@@ -198,7 +202,7 @@ impl GpuYuv {
             Extent3d { width: w1, height: h1, depth_or_array_layers: 1 },
         );
 
-        debug!("NV12 wrote bytes: Y={} UV={}", y_packed.len(), uv_packed.len());
+        info!("NV12 wrote bytes: Y={} UV={}", y_packed.len(), uv_packed.len());
 
         unsafe { avf_iosurface_unlock(s_ref) };
         Ok(())
