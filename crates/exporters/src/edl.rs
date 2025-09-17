@@ -125,10 +125,14 @@ fn parse_edl(content: &str, config: &ExportConfig) -> Result<(Sequence, Vec<Asse
                     ItemKind::Video {
                         src: src_path.clone(),
                         frame_rate: Some(sequence.fps.num as f32 / sequence.fps.den as f32),
+                        in_offset_sec: 0.0,
+                        rate: 1.0,
                     }
                 } else {
                     ItemKind::Audio {
                         src: src_path.clone(),
+                        in_offset_sec: 0.0,
+                        rate: 1.0,
                     }
                 },
             };

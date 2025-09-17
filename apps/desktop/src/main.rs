@@ -4,7 +4,7 @@ use eframe::egui::Widget;
 use eframe::egui_wgpu; // for native TextureId path
 use project::{AssetRow, ProjectDb};
 use timeline::{Fps, Item, ItemKind, Sequence, Track};
-use std::sync::{Arc, Mutex, atomic::{AtomicBool, Ordering}};
+use std::sync::{Arc, Mutex, atomic::{AtomicBool, Ordering}, OnceLock};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 use std::path::PathBuf;
@@ -12,17 +12,66 @@ mod interaction;
 use interaction::{DragMode, DragState};
 mod audio;
 use audio::AudioState;
+mod audio_engine;
 use jobs::{JobEvent, JobStatus};
 use media_io::YuvPixFmt;
 use native_decoder::{create_decoder, DecoderConfig, is_native_decoding_available, ZeroCopyVideoRenderer};
 use std::collections::HashMap;
+use std::collections::VecDeque;
 use native_decoder::{
     NativeVideoDecoder, VideoFrame, YuvPixFmt as NativeYuvPixFmt
 };
 use std::hash::Hash;
 // (Arc already imported above)
+use crossbeam_channel as channel;
+
+#[derive(Default, Debug, Clone)]
+struct PlaybackClock {
+    playing: bool,
+    rate: f64,                 // 1.0 = normal
+    anchor_instant: Option<Instant>,
+    anchor_timeline_sec: f64,  // timeline time at anchor
+}
+
+impl PlaybackClock {
+    fn play(&mut self, current_timeline_sec: f64) {
+        self.playing = true;
+        self.anchor_timeline_sec = current_timeline_sec;
+        self.anchor_instant = Some(Instant::now());
+    }
+    fn pause(&mut self, current_timeline_sec: f64) {
+        self.playing = false;
+        self.anchor_timeline_sec = current_timeline_sec;
+        self.anchor_instant = None;
+    }
+    fn set_rate(&mut self, rate: f64, current_timeline_sec: f64) {
+        // re-anchor to avoid jumps
+        self.anchor_timeline_sec = current_timeline_sec;
+        self.anchor_instant = Some(Instant::now());
+        self.rate = rate;
+    }
+    fn now(&self) -> f64 {
+        if self.playing {
+            let dt = self.anchor_instant.unwrap().elapsed().as_secs_f64();
+            self.anchor_timeline_sec + dt * self.rate
+        } else {
+            self.anchor_timeline_sec
+        }
+    }
+    fn seek_to(&mut self, timeline_sec: f64) {
+        self.anchor_timeline_sec = timeline_sec;
+        if self.playing {
+            self.anchor_instant = Some(Instant::now());
+        }
+    }
+}
+
+use tracing_subscriber::EnvFilter;
 
 fn main() {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(EnvFilter::from_default_env())
+        .try_init();
     // Ensure DB exists before UI
     let data_dir = project::app_data_dir();
     std::fs::create_dir_all(&data_dir).expect("create data dir");
@@ -42,6 +91,7 @@ const PREFETCH_BUDGET_PER_TICK: usize = 6;
 #[derive(Default)]
 struct DecodeManager {
     decoders: HashMap<String, DecoderEntry>,
+    workers: HashMap<String, DecodeWorkerRuntime>,
 }
 
 struct DecoderEntry {
@@ -115,6 +165,26 @@ impl DecodeManager {
         frame
     }
 
+    /// Decode exactly once without advancing/prefetching (used when paused).
+    fn decode_exact_once(&mut self, path: &str, cfg: &DecoderConfig, target_ts: f64) -> Option<VideoFrame> {
+        let entry = self.get_or_create(path, cfg).ok()?;
+        entry.attempts_this_tick = 0;
+        let frame = entry.decoder.decode_frame(target_ts).ok().flatten();
+        entry.attempts_this_tick += 1;
+        if let Some(ref f) = frame {
+            entry.last_pts = Some(f.timestamp);
+            entry.last_fmt = Some(match f.format {
+                NativeYuvPixFmt::Nv12 => "NV12",
+                NativeYuvPixFmt::P010 => "P010",
+                _ => "YUV",
+            });
+            entry.consecutive_misses = 0;
+        } else {
+            entry.consecutive_misses = entry.consecutive_misses.saturating_add(1);
+        }
+        frame
+    }
+
     /// Attempt zero-copy decode via IOSurface. On macOS only.
     #[cfg(target_os = "macos")]
     fn decode_zero_copy(&mut self, path: &str, target_ts: f64) -> Option<native_decoder::IOSurfaceFrame> {
@@ -140,6 +210,24 @@ impl DecodeManager {
             f = dec.decode_frame_zero_copy(target_ts).ok().flatten();
         }
         f
+    }
+
+    /// Single attempt zero-copy decode without prefetching (paused mode)
+    #[cfg(target_os = "macos")]
+    fn decode_zero_copy_once(&mut self, path: &str, target_ts: f64) -> Option<native_decoder::IOSurfaceFrame> {
+        use native_decoder::YuvPixFmt as Nyf;
+        let key = Self::normalize_path_key(path);
+        let entry = if let Some(e) = self.decoders.get_mut(&key) { e } else {
+            let cfg = DecoderConfig { hardware_acceleration: true, preferred_format: Some(Nyf::Nv12), zero_copy: false };
+            let _ = self.get_or_create(path, &cfg);
+            self.decoders.get_mut(&key).unwrap()
+        };
+        if entry.zc_decoder.is_none() {
+            let cfg_zc = DecoderConfig { hardware_acceleration: true, preferred_format: Some(Nyf::Nv12), zero_copy: true };
+            if let Ok(dec) = create_decoder(path, cfg_zc) { entry.zc_decoder = Some(dec); } else { return None; }
+        }
+        let dec = entry.zc_decoder.as_mut().unwrap();
+        dec.decode_frame_zero_copy(target_ts).ok().flatten()
     }
 
     #[cfg(not(target_os = "macos"))]
@@ -171,6 +259,155 @@ impl DecodeManager {
             e.draws = e.draws.saturating_add(1);
         }
     }
+
+    // Worker management for decoupled decode → render
+    fn ensure_worker(&mut self, path: &str) {
+        let key = Self::normalize_path_key(path);
+        if self.workers.contains_key(&key) { return; }
+        let rt = spawn_worker(&key);
+        self.workers.insert(key, rt);
+    }
+
+    fn send_cmd(&mut self, path: &str, cmd: DecodeCmd) {
+        let key = Self::normalize_path_key(path);
+        if let Some(w) = self.workers.get(&key) {
+            let _ = w.cmd_tx.send(cmd);
+        }
+    }
+
+    fn take_latest(&mut self, path: &str) -> Option<VideoFrameOut> {
+        let key = Self::normalize_path_key(path);
+        if let Some(w) = self.workers.get(&key) {
+            if let Ok(mut g) = w.slot.0.lock() { return g.take(); }
+        }
+        None
+    }
+}
+
+// ---------- Playback engine state ----------
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PlayState { Paused, Seeking, Playing, Scrubbing }
+
+struct EngineState {
+    state: PlayState,
+    rate: f32,      // 1.0 by default
+    target_pts: f64,
+}
+
+// ---------- Decoupled frame types ----------
+#[derive(Clone, Copy, Debug)]
+struct VideoProps { w: u32, h: u32, fps: f64, fmt: YuvPixFmt }
+
+#[derive(Clone)]
+enum FramePayload { Cpu { y: Arc<[u8]>, uv: Arc<[u8]> } }
+
+#[derive(Clone)]
+struct VideoFrameOut { pts: f64, props: VideoProps, payload: FramePayload }
+
+// ---------- Worker control ----------
+enum DecodeCmd {
+    Play { start_pts: f64, rate: f32 },
+    Seek { target_pts: f64 },
+    Pause,
+    Stop,
+}
+
+struct LatestFrameSlot(Arc<Mutex<Option<VideoFrameOut>>>);
+
+struct DecodeWorkerRuntime {
+    #[allow(dead_code)]
+    handle: std::thread::JoinHandle<()>,
+    cmd_tx: channel::Sender<DecodeCmd>,
+    slot: LatestFrameSlot,
+}
+
+fn spawn_worker(path: &str) -> DecodeWorkerRuntime {
+    use channel::{unbounded, Receiver, Sender};
+    let (cmd_tx, cmd_rx) = unbounded::<DecodeCmd>();
+    let slot = LatestFrameSlot(Arc::new(Mutex::new(None)));
+    let slot_for_worker = LatestFrameSlot(slot.0.clone());
+    let path = path.to_string();
+    let handle = std::thread::spawn(move || {
+        // Initialize decoders
+        let cfg_cpu = DecoderConfig { hardware_acceleration: true, preferred_format: Some(NativeYuvPixFmt::Nv12), zero_copy: false };
+        let mut cpu_dec = match create_decoder(&path, cfg_cpu) { Ok(d) => d, Err(e) => { eprintln!("[worker] create_decoder CPU failed: {e}"); return; } };
+        // For now, worker outputs CPU NV12/P010 frames only (zero-copy can be added later)
+
+        let props = cpu_dec.get_properties();
+        let fps = if props.frame_rate > 0.0 { props.frame_rate } else { 30.0 };
+        let frame_dur = if fps > 0.0 { 1.0 / fps } else { 1.0 / 30.0 };
+
+        let mut mode = PlayState::Paused;
+        let mut rate: f32 = 1.0;
+        let mut anchor_pts: f64 = 0.0;
+        let mut anchor_t = std::time::Instant::now();
+        let mut running = true;
+
+        let mut attempt_decode = |target: f64| -> Option<VideoFrameOut> {
+            // Try zero-copy first (macOS), then CPU. Do a few coax attempts.
+            // CPU path
+            let mut f = cpu_dec.decode_frame(target).ok().flatten();
+            let mut tries = 0;
+            while f.is_none() && tries < PREFETCH_BUDGET_PER_TICK {
+                let _ = cpu_dec.decode_frame(target);
+                tries += 1;
+                f = cpu_dec.decode_frame(target).ok().flatten();
+            }
+            if let Some(vf) = f {
+                let fmt = match vf.format { NativeYuvPixFmt::Nv12 => YuvPixFmt::Nv12, NativeYuvPixFmt::P010 => YuvPixFmt::P010 };
+                let y: Arc<[u8]> = Arc::from(vf.y_plane.into_boxed_slice());
+                let uv: Arc<[u8]> = Arc::from(vf.uv_plane.into_boxed_slice());
+                return Some(VideoFrameOut { pts: vf.timestamp, props: VideoProps { w: vf.width, h: vf.height, fps, fmt }, payload: FramePayload::Cpu { y, uv } });
+            }
+            None
+        };
+
+        let mut pending: VecDeque<VideoFrameOut> = VecDeque::new();
+        while running {
+            // Drain commands
+            while let Ok(cmd) = cmd_rx.try_recv() {
+                match cmd {
+                    DecodeCmd::Play { start_pts, rate: r } => {
+                        // Only (re)anchor when transitioning into Playing; otherwise keep smooth progression
+                        if mode != PlayState::Playing {
+                            mode = PlayState::Playing;
+                            anchor_pts = start_pts;
+                            anchor_t = std::time::Instant::now();
+                        }
+                        rate = r;
+                    }
+                    DecodeCmd::Seek { target_pts } => { mode = PlayState::Seeking; anchor_pts = target_pts; }
+                    DecodeCmd::Pause => { mode = PlayState::Paused; }
+                    DecodeCmd::Stop => { running = false; }
+                }
+            }
+
+            match mode {
+                PlayState::Playing => {
+                    let dt = anchor_t.elapsed().as_secs_f64();
+                    let target = anchor_pts + dt * (rate as f64);
+                    if let Some(out) = attempt_decode(target) {
+                        eprintln!("[WORKER] out pts={:.3}", out.pts);
+                        if let Ok(mut g) = slot_for_worker.0.lock() { *g = Some(out); }
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(4));
+                }
+                PlayState::Seeking | PlayState::Scrubbing => {
+                    let target = anchor_pts;
+                    if let Some(out) = attempt_decode(target) {
+                        eprintln!("[WORKER] out pts={:.3}", out.pts);
+                        if let Ok(mut g) = slot_for_worker.0.lock() { *g = Some(out); }
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(4));
+                }
+                PlayState::Paused => {
+                    std::thread::sleep(std::time::Duration::from_millis(6));
+                }
+            }
+        }
+    });
+
+    DecodeWorkerRuntime { handle, cmd_tx, slot }
 }
 
 struct App {
@@ -188,6 +425,7 @@ struct App {
     play_anchor_frame: i64,
     preview: PreviewState,
     audio: AudioState,
+    audio_out: Option<audio_engine::AudioEngine>,
     selected: Option<(usize, usize)>,
     drag: Option<DragState>,
     export: ExportUiState,
@@ -196,6 +434,23 @@ struct App {
     job_events: Vec<JobEvent>,
     show_jobs: bool,
     decode_mgr: DecodeManager,
+    playback_clock: PlaybackClock,
+    audio_cache: AudioCache,
+    // When true during this frame, enable audible scrubbing while paused
+    scrub_audio_active: bool,
+    // pending vertical move: (from_track, item_index, to_track)
+    pending_move: Option<(usize, usize, usize)>,
+    // Last successfully presented key: (source path, media time in milliseconds)
+    // Using media time (not playhead frame) avoids wrong reuse when clips share a path but have different in_offset/rate.
+    last_preview_key: Option<(String, i64)>,
+    // Playback engine
+    engine: EngineState,
+    // Debounce decode commands: remember last sent (state, path, optional seek bucket)
+    last_sent: Option<(PlayState, String, Option<i64>)>,
+    // Throttled engine log state
+    // (Used only for preview_ui logging when sending worker commands)
+    // Not strictly necessary, but kept for future UI log hygiene.
+    // last_engine_log: Option<Instant>,
 }
 
 impl App {
@@ -221,6 +476,7 @@ impl App {
             play_anchor_frame: 0,
             preview: PreviewState::new(),
             audio: AudioState::new(),
+            audio_out: audio_engine::AudioEngine::new().ok(),
             selected: None,
             drag: None,
             export: ExportUiState::default(),
@@ -229,6 +485,43 @@ impl App {
             job_events: Vec::new(),
             show_jobs: false,
             decode_mgr: DecodeManager::default(),
+            playback_clock: PlaybackClock { rate: 1.0, ..Default::default() },
+            audio_cache: AudioCache::default(),
+            scrub_audio_active: false,
+            pending_move: None,
+            last_preview_key: None,
+            engine: EngineState { state: PlayState::Paused, rate: 1.0, target_pts: 0.0 },
+            last_sent: None,
+        }
+    }
+
+    fn request_audio_peaks(&mut self, _path: &std::path::Path) {
+        // Placeholder: integrate with audio decoding backend to compute peaks.
+        // Keep bounded: one job per path. For now, no-op to avoid blocking UI.
+    }
+
+    fn split_clip_at_frame(&mut self, track: usize, item: usize, split_frame: i64) {
+        if track >= self.seq.tracks.len() { return; }
+        let items = &mut self.seq.tracks[track].items;
+        if item >= items.len() { return; }
+        let clip = items[item].clone();
+        let from = clip.from;
+        let dur = clip.duration_in_frames;
+        if split_frame <= from || split_frame >= from + dur { return; }
+        let left_dur = split_frame - from;
+        let right_dur = dur - left_dur;
+        // Left
+        items[item].duration_in_frames = left_dur;
+        // Right
+        let mut right = clip.clone();
+        right.from = split_frame;
+        right.duration_in_frames = right_dur;
+        items.insert(item+1, right);
+    }
+
+    fn remove_clip(&mut self, track: usize, item: usize) {
+        if track < self.seq.tracks.len() && item < self.seq.tracks[track].items.len() {
+            self.seq.tracks[track].items.remove(item);
         }
     }
 
@@ -309,12 +602,12 @@ impl App {
             let duration = asset.duration_frames.unwrap_or(150).max(1);
             let id = uuid::Uuid::new_v4().to_string();
             let kind = if is_audio {
-                ItemKind::Audio { src: asset.src_abs.clone() }
+                ItemKind::Audio { src: asset.src_abs.clone(), in_offset_sec: 0.0, rate: 1.0 }
             } else if asset.kind.eq_ignore_ascii_case("image") {
                 ItemKind::Image { src: asset.src_abs.clone() }
             } else {
                 let fr = match (asset.fps_num, asset.fps_den) { (Some(n), Some(d)) if d != 0 => Some(n as f32 / d as f32), _ => None };
-                ItemKind::Video { src: asset.src_abs.clone(), frame_rate: fr }
+                ItemKind::Video { src: asset.src_abs.clone(), frame_rate: fr, in_offset_sec: 0.0, rate: 1.0 }
             };
             track.items.push(Item { id, from, duration_in_frames: duration, kind });
             let end = self.seq.tracks.iter().flat_map(|t| t.items.iter().map(|it| it.from + it.duration_in_frames)).max().unwrap_or(0);
@@ -323,6 +616,8 @@ impl App {
     }
 
     fn timeline_ui(&mut self, ui: &mut egui::Ui) {
+        // Reset scrubbing flag; set true only while background dragging
+        self.scrub_audio_active = false;
         ui.horizontal(|ui| {
             ui.label("Zoom");
             ui.add(egui::Slider::new(&mut self.zoom_px_per_frame, 0.2..=20.0).logarithmic(true));
@@ -335,8 +630,9 @@ impl App {
         let track_h = 48.0;
         let content_w = (self.seq.duration_in_frames as f32 * self.zoom_px_per_frame).max(1000.0);
         let content_h = (self.seq.tracks.len() as f32 * track_h).max(200.0);
-        egui::ScrollArea::both().show(ui, |ui| {
-            let (rect, response) = ui.allocate_exact_size(egui::vec2(content_w, content_h), egui::Sense::click());
+        egui::ScrollArea::both().drag_to_scroll(false).show(ui, |ui| {
+            let mut to_request: Vec<std::path::PathBuf> = Vec::new();
+            let (rect, response) = ui.allocate_exact_size(egui::vec2(content_w, content_h), egui::Sense::click_and_drag());
             let painter = ui.painter_at(rect);
             // Background
             painter.rect_filled(rect, 0.0, egui::Color32::from_rgb(18, 18, 20));
@@ -373,14 +669,64 @@ impl App {
                     painter.rect_stroke(r, 4.0, border);
                     painter.text(r.center_top() + egui::vec2(0.0, 12.0), egui::Align2::CENTER_TOP, label, egui::FontId::monospace(12.0), egui::Color32::WHITE);
 
-                    if hovered && ui.input(|i| i.pointer.primary_pressed()) {
+                    // Optional lightweight waveform lane under clips (audio or video)
+                    if let Some(src_path) = match &it.kind { 
+                        ItemKind::Audio { src, .. } => Some(src.as_str()),
+                        ItemKind::Video { src, .. } => Some(src.as_str()),
+                        _ => None,
+                    } {
+                        let pbuf = std::path::PathBuf::from(src_path);
+                        if let Some(peaks) = self.audio_cache.map.get(&pbuf) {
+                            let rect_lane = r.shrink2(egui::vec2(2.0, 6.0));
+                            let n = peaks.peaks.len().max(1);
+                            let mut pts_top: Vec<egui::Pos2> = Vec::with_capacity(n);
+                            let mut pts_bot: Vec<egui::Pos2> = Vec::with_capacity(n);
+                            for (i, (mn, mx)) in peaks.peaks.iter().enumerate() {
+                                let t = if n > 1 { i as f32 / (n as f32 - 1.0) } else { 0.0 };
+                                let x = egui::lerp(rect_lane.left()..=rect_lane.right(), t);
+                                let y0 = egui::lerp(rect_lane.center().y..=rect_lane.top(), mx.abs().min(1.0));
+                                let y1 = egui::lerp(rect_lane.center().y..=rect_lane.bottom(), mn.abs().min(1.0));
+                                pts_top.push(egui::pos2(x, y0));
+                                pts_bot.push(egui::pos2(x, y1));
+                            }
+                            let stroke = egui::Stroke::new(1.0, egui::Color32::from_rgb(120,180,240));
+                            ui.painter().add(egui::Shape::line(pts_top, stroke));
+                            ui.painter().add(egui::Shape::line(pts_bot, stroke));
+                        } else {
+                            to_request.push(pbuf);
+                        }
+                    }
+
+                    // Make the clip rect an interactive drag target so ScrollArea doesn't pan
+                    let resp = ui.interact(
+                        r,
+                        egui::Id::new(("clip", ti, ii)),
+                        egui::Sense::click_and_drag(),
+                    );
+                    if resp.clicked() { self.selected = Some((ti, ii)); }
+                    if resp.drag_started() {
+                        let mx = resp.interact_pointer_pos().unwrap_or(egui::pos2(0.0,0.0)).x;
                         // Determine drag mode by edge proximity
-                        let mx = ui.input(|i| i.pointer.hover_pos().unwrap_or(egui::pos2(0.0,0.0))).x;
                         let mode = if (mx - r.left()).abs() <= 6.0 { DragMode::TrimStart }
                                    else if (mx - r.right()).abs() <= 6.0 { DragMode::TrimEnd }
                                    else { DragMode::Move };
                         self.selected = Some((ti, ii));
                         self.drag = Some(DragState { track: ti, item: ii, mode, start_mouse_x: mx, orig_from: it.from, orig_dur: it.duration_in_frames });
+                    }
+                    if resp.drag_released() {
+                        // On release, allow moving the clip to a different track if pointer is over it
+                        if let Some(pos) = ui.input(|i| i.pointer.hover_pos()) {
+                            let mut target_track = (((pos.y - rect.top()) / track_h).floor() as isize) as isize;
+                            // Clamp to valid range
+                            if target_track < 0 { target_track = 0; }
+                            if target_track >= self.seq.tracks.len() as isize { target_track = (self.seq.tracks.len() as isize) - 1; }
+                            let target_track = target_track as usize;
+                            if target_track != ti {
+                                // Defer the actual move until after we finish iterating/borrowing
+                                self.pending_move = Some((ti, ii, target_track));
+                            }
+                        }
+                        self.drag = None;
                     }
                 }
             }
@@ -388,21 +734,58 @@ impl App {
             let phx = rect.left() + self.playhead as f32 * self.zoom_px_per_frame;
             painter.line_segment([egui::pos2(phx, rect.top()), egui::pos2(phx, rect.bottom())], egui::Stroke::new(2.0, egui::Color32::from_rgb(220, 60, 60)));
 
-            if response.clicked() {
-                let pos = response.interact_pointer_pos().unwrap_or(rect.left_top());
-                let frame = ((pos.x - rect.left()) / self.zoom_px_per_frame).round() as i64;
-                let old_playhead = self.playhead;
-                self.playhead = frame.clamp(0, self.seq.duration_in_frames);
-                
-                // Only request repaint if playhead actually changed
-                if self.playhead != old_playhead {
-                    // Repaint will be triggered by the main update loop
+            // Click/drag background to scrub (when not dragging a clip)
+            if self.drag.is_none() {
+                // Single click: move playhead on mouse up as well
+                if response.clicked() {
+                    if let Some(pos) = response.interact_pointer_pos() {
+                        let local_px = (pos.x - rect.left()).max(0.0) as f64;
+                        let fps = (self.seq.fps.num.max(1) as f64) / (self.seq.fps.den.max(1) as f64);
+                        let frames = (local_px / self.zoom_px_per_frame as f64).round() as i64;
+                        let sec = (frames as f64) / fps;
+                        self.playback_clock.seek_to(sec);
+                        self.playhead = frames.clamp(0, self.seq.duration_in_frames);
+                        self.engine.state = PlayState::Seeking;
+                    }
+                }
+                // Drag: continuously update while primary is down
+                if response.dragged() && ui.input(|i| i.pointer.primary_down()) {
+                    if let Some(pos) = ui.input(|i| i.pointer.interact_pos()) {
+                        let local_px = (pos.x - rect.left()).max(0.0) as f64;
+                        let fps = (self.seq.fps.num.max(1) as f64) / (self.seq.fps.den.max(1) as f64);
+                        let frames = (local_px / self.zoom_px_per_frame as f64).round() as i64;
+                        let sec = (frames as f64) / fps;
+                        self.playback_clock.seek_to(sec);
+                        self.playhead = frames.clamp(0, self.seq.duration_in_frames);
+                        // Enable audible scrubbing while paused
+                        self.scrub_audio_active = true;
+                        self.engine.state = PlayState::Scrubbing;
+                    }
+                }
+            }
+
+            // Timeline hotkeys: split/delete
+            let pressed_split = ui.input(|i| i.key_pressed(egui::Key::K) || (i.modifiers.command && i.key_pressed(egui::Key::S)));
+            let pressed_delete = ui.input(|i| i.key_pressed(egui::Key::Delete) || i.key_pressed(egui::Key::Backspace));
+            if pressed_split {
+                if let Some((t, iidx)) = self.selected {
+                    let fps = (self.seq.fps.num.max(1) as f64) / (self.seq.fps.den.max(1) as f64);
+                    let t_sec = self.playback_clock.now();
+                    let split_frame = (t_sec * fps).round() as i64;
+                    self.split_clip_at_frame(t, iidx, split_frame);
+                }
+            }
+            if pressed_delete {
+                if let Some((t, iidx)) = self.selected.take() {
+                    self.remove_clip(t, iidx);
                 }
             }
 
             if let Some(drag) = self.drag {
                 if ui.input(|i| !i.pointer.primary_down()) {
                     self.drag = None;
+                    // End of scrubbing drag
+                    if self.engine.state == PlayState::Scrubbing { self.engine.state = PlayState::Paused; }
                 } else if let Some((ti, ii)) = self.selected {
                     if ti < self.seq.tracks.len() && ii < self.seq.tracks[ti].items.len() {
                         let item = &mut self.seq.tracks[ti].items[ii];
@@ -419,12 +802,20 @@ impl App {
                                 item.from = new_from;
                             }
                             DragMode::TrimStart => {
-                                let mut new_from = (drag.orig_from + df).clamp(0, drag.orig_from + drag.orig_dur - 1);
+                                let new_from = (drag.orig_from + df).clamp(0, drag.orig_from + drag.orig_dur - 1);
+                                let delta_frames = (new_from - drag.orig_from).max(0);
                                 let secf = (new_from as f32 / fpsf).round() * fpsf;
-                                if ((secf - new_from as f32).abs()) <= eps { new_from = secf as i64; }
-                                let delta = new_from - drag.orig_from;
-                                item.from = new_from;
-                                item.duration_in_frames = (drag.orig_dur - delta).max(1);
+                                let snap_new_from = if ((secf - new_from as f32).abs()) <= eps { secf as i64 } else { new_from };
+                                // Advance source by delta_sec
+                                let fps = (self.seq.fps.num.max(1) as f64) / (self.seq.fps.den.max(1) as f64);
+                                let delta_sec = (delta_frames as f64) / fps;
+                                item.from = snap_new_from;
+                                item.duration_in_frames = (drag.orig_dur - delta_frames).max(1);
+                                match &mut item.kind {
+                                    ItemKind::Video { in_offset_sec, .. } => { *in_offset_sec = (*in_offset_sec + delta_sec).max(0.0); }
+                                    ItemKind::Audio { in_offset_sec, .. } => { *in_offset_sec = (*in_offset_sec + delta_sec).max(0.0); }
+                                    _ => {}
+                                }
                             }
                             DragMode::TrimEnd => {
                                 let mut new_dur = (drag.orig_dur + df).max(1);
@@ -437,6 +828,24 @@ impl App {
                     }
                 }
             }
+
+            // Apply any pending cross-track move now that we are out of the per-item iteration
+            if let Some((from_t, item_idx, to_t)) = self.pending_move.take() {
+                if from_t < self.seq.tracks.len() && to_t < self.seq.tracks.len() {
+                    if item_idx < self.seq.tracks[from_t].items.len() {
+                        // Remove the item from the old track
+                        let item = self.seq.tracks[from_t].items.remove(item_idx);
+                        // Insert at the end of the target track (keeps the same timeline start/duration)
+                        self.seq.tracks[to_t].items.push(item);
+                        // Update selection to the new location
+                        let new_index = self.seq.tracks[to_t].items.len().saturating_sub(1);
+                        self.selected = Some((to_t, new_index));
+                    }
+                }
+            }
+
+            // Defer any peak requests until after immutable borrows end
+            for p in to_request { self.request_audio_peaks(&p); }
         });
     }
 
@@ -460,10 +869,37 @@ impl App {
     }
 
     fn preview_ui(&mut self, ctx: &egui::Context, frame: &eframe::Frame, ui: &mut egui::Ui) {
-        // Determine current visual source at playhead
-        let fps = self.seq.fps.num.max(1) as f32 / self.seq.fps.den.max(1) as f32;
-        let t_sec = self.playhead as f32 / fps;
+        // Determine current visual source at playhead (lock to exact frame)
+        let fps = self.seq.fps.num.max(1) as f64 / self.seq.fps.den.max(1) as f64;
+        let t_playhead = self.playback_clock.now();
+        let playhead_frame = if self.engine.state == PlayState::Playing {
+            (t_playhead * fps).floor() as i64
+        } else {
+            (t_playhead * fps).round() as i64
+        };
+        self.playhead = playhead_frame;
+        let target_ts = (playhead_frame as f64) / fps;
+        let t_sec = target_ts as f32;
         let source = current_visual_source(&self.seq, self.playhead);
+
+        // Debug: shader mode toggle for YUV preview
+        ui.horizontal(|ui| {
+            ui.label("Shader:");
+            let mode = &mut self.preview.shader_mode;
+            let solid = matches!(*mode, PreviewShaderMode::Solid);
+            if ui.selectable_label(solid, "Solid").clicked() { *mode = PreviewShaderMode::Solid; ctx.request_repaint(); }
+            let showy = matches!(*mode, PreviewShaderMode::ShowY);
+            if ui.selectable_label(showy, "Y").clicked() { *mode = PreviewShaderMode::ShowY; ctx.request_repaint(); }
+            let uvd = matches!(*mode, PreviewShaderMode::UvDebug);
+            if ui.selectable_label(uvd, "UV").clicked() { *mode = PreviewShaderMode::UvDebug; ctx.request_repaint(); }
+            let nv12 = matches!(*mode, PreviewShaderMode::Nv12);
+            if ui.selectable_label(nv12, "NV12").clicked() { *mode = PreviewShaderMode::Nv12; ctx.request_repaint(); }
+        });
+        // Hotkeys 1/2/3
+        if ui.input(|i| i.key_pressed(egui::Key::Num1)) { self.preview.shader_mode = PreviewShaderMode::Solid; ctx.request_repaint(); }
+        if ui.input(|i| i.key_pressed(egui::Key::Num2)) { self.preview.shader_mode = PreviewShaderMode::ShowY; ctx.request_repaint(); }
+        if ui.input(|i| i.key_pressed(egui::Key::Num3)) { self.preview.shader_mode = PreviewShaderMode::UvDebug; ctx.request_repaint(); }
+        if ui.input(|i| i.key_pressed(egui::Key::Num4)) { self.preview.shader_mode = PreviewShaderMode::Nv12; ctx.request_repaint(); }
 
         // Layout: reserve a 16:9 box or fit available space
         let avail = ui.available_size();
@@ -472,23 +908,7 @@ impl App {
         if h > avail.y { h = avail.y; w = (h * 16.0 / 9.0).round(); }
         let desired = (w as u32, h as u32);
 
-        // Playback advance (anchored clock to avoid jitter)
-        if self.playing {
-            let now = Instant::now();
-            if self.play_anchor_instant.is_none() {
-                self.play_anchor_instant = Some(now);
-                self.play_anchor_frame = self.playhead;
-            }
-            let base = self.play_anchor_frame;
-            let elapsed = now.duration_since(self.play_anchor_instant.unwrap());
-            let advanced = (fps * elapsed.as_secs_f32()).floor() as i64;
-            self.playhead = (base + advanced).clamp(0, self.seq.duration_in_frames);
-            if self.playhead >= self.seq.duration_in_frames {
-                self.playing = false;
-            }
-        } else {
-            self.play_anchor_instant = None;
-        }
+        // Playback progression handled by PlaybackClock (no speed-up)
 
         // Draw
         let (rect, _resp) = ui.allocate_exact_size(egui::vec2(w, h), egui::Sense::hover());
@@ -497,58 +917,100 @@ impl App {
         
         // Use persistent decoder with prefetch
         if let Some(src) = source.as_ref() {
-        if let Some(rs) = frame.wgpu_render_state() {
-                let decoder_config = DecoderConfig {
-                    hardware_acceleration: true,
-                    preferred_format: Some(NativeYuvPixFmt::Nv12),
-                    zero_copy: false, // Phase 1 only
-                };
-                
-                let vf_opt = self.decode_mgr.decode_and_prefetch(&src.path, &decoder_config, t_sec as f64);
-                // Try zero-copy first (macOS only)
-                #[cfg(target_os = "macos")]
-                let zc_opt = self.decode_mgr.decode_zero_copy(&src.path, t_sec as f64);
-                #[cfg(not(target_os = "macos"))]
-                let zc_opt: Option<native_decoder::IOSurfaceFrame> = None;
+            if let Some(rs) = frame.wgpu_render_state() {
+                // New: use background decode worker and small frame queue
+                let (active_path, media_t) = if let Some((p, mt)) = active_video_media_time(&self.seq, t_playhead) { (p, mt) } else { (src.path.clone(), t_playhead) };
+                self.engine.target_pts = media_t;
+                self.decode_mgr.ensure_worker(&active_path);
 
-                // Prefer zero-copy if available; otherwise fallback to CPU present path
-                let yuv_result = {
-                    #[cfg(target_os = "macos")]
-                    {
-                        if let Some(ref zc) = zc_opt {
-                            if let Some(res) = self.preview.present_nv12_zero_copy(&rs, zc) { res } else { self.preview.present_yuv_with_frame(&rs, &src.path, t_sec as f64, vf_opt.as_ref()) }
-                        } else {
-                            self.preview.present_yuv_with_frame(&rs, &src.path, t_sec as f64, vf_opt.as_ref())
+                // Log engine vs clock once per second or on state change
+                {
+                    static mut LAST_LOG_INSTANT: Option<std::time::Instant> = None;
+                    static mut LAST_LOG_STATE: Option<(PlayState, bool)> = None;
+                    let now = std::time::Instant::now();
+                    let clock_playing = self.playback_clock.playing;
+                    let should_log = unsafe {
+                        let last = LAST_LOG_INSTANT.get_or_insert(now);
+                        let changed = LAST_LOG_STATE.map(|(s, c)| s != self.engine.state || c != clock_playing).unwrap_or(true);
+                        let elapsed = now.duration_since(*last).as_secs_f64() >= 1.0;
+                        if changed || elapsed { *last = now; LAST_LOG_STATE = Some((self.engine.state, clock_playing)); true } else { false }
+                    };
+                    if should_log {
+                        eprintln!("[ENGINE] state={:?} clock_playing={} target_pts={:.3}", self.engine.state, clock_playing, media_t);
+                    }
+                }
+
+                // Debounce sends: include seek bucket for non-playing states
+                let fps_seq = (self.seq.fps.num.max(1) as f64) / (self.seq.fps.den.max(1) as f64);
+                let seek_bucket = (media_t * fps_seq).round() as i64;
+                let k = match self.engine.state {
+                    PlayState::Playing => (self.engine.state, active_path.clone(), None),
+                    _ => (self.engine.state, active_path.clone(), Some(seek_bucket)),
+                };
+                if self.last_sent != Some(k.clone()) {
+                    match self.engine.state {
+                        PlayState::Playing => { let _ = self.decode_mgr.send_cmd(&active_path, DecodeCmd::Play { start_pts: media_t, rate: self.engine.rate }); }
+                        PlayState::Scrubbing | PlayState::Seeking | PlayState::Paused => { let _ = self.decode_mgr.send_cmd(&active_path, DecodeCmd::Seek { target_pts: media_t }); }
+                    }
+                    if self.engine.state == PlayState::Scrubbing { ctx.request_repaint(); }
+                    self.last_sent = Some(k);
+                }
+
+                // Drain worker and pick a frame (latest-wins slot)
+                let newest = self.decode_mgr.take_latest(&active_path);
+                let queue_len = if newest.is_some() { 1 } else { 0 };
+                let tol = {
+                    let fps = (self.seq.fps.num.max(1) as f64) / (self.seq.fps.den.max(1) as f64);
+                    let frame_dur = if fps > 0.0 { 1.0 / fps } else { 1.0 / 30.0 };
+                    (0.5 * frame_dur).max(0.012)
+                };
+                let is_actually_playing = self.engine.state == PlayState::Playing || self.playback_clock.playing;
+                let picked: Option<VideoFrameOut> = if is_actually_playing {
+                    newest
+                } else {
+                    newest.filter(|f| (f.pts - media_t).abs() <= tol)
+                };
+
+                if let Some(f) = picked {
+                    if let FramePayload::Cpu { y, uv } = f.payload {
+                        if let Some((fmt, ytex, uvtex)) = self.preview.present_yuv_from_bytes(&rs, f.props.fmt, &y, &uv, f.props.w, f.props.h) {
+                            eprintln!("[PREVIEW] draw=yuv fmt={:?} mode={:?}", fmt, self.preview.shader_mode);
+                            let use_uint = matches!(fmt, YuvPixFmt::P010) && !device_supports_16bit_norm(&rs);
+                            let cb = egui_wgpu::Callback::new_paint_callback(rect, PreviewYuvCallback { y_tex: ytex, uv_tex: uvtex, fmt, use_uint, w: f.props.w, h: f.props.h, mode: self.preview.shader_mode });
+                            ui.painter().add(cb);
+                            // HUD overlay: state, queue, delta ms
+                            let d_ms = ((f.pts - media_t) * 1000.0) as i32;
+                            let hud = format!(
+                                "state={:?}  queue={}  Δ={}ms  picked={:.3}  target={:.3}",
+                                self.engine.state, queue_len, d_ms, f.pts, media_t
+                            );
+                            painter.text(rect.left_top() + egui::vec2(5.0, 5.0), egui::Align2::LEFT_TOP, hud, egui::FontId::monospace(10.0), egui::Color32::WHITE);
                         }
                     }
-                    #[cfg(not(target_os = "macos"))]
-                    {
-                        self.preview.present_yuv_with_frame(&rs, &src.path, t_sec as f64, vf_opt.as_ref())
-                    }
-                };
-                
-                if let Some((fmt, y, uv)) = yuv_result {
-                    let use_uint = matches!(fmt, YuvPixFmt::P010) && !device_supports_16bit_norm(&rs);
-                    let (tex_w, tex_h) = if zc_opt.is_some() {
-                        let z = zc_opt.as_ref().unwrap();
-                        (z.width, z.height)
-                    } else {
-                        (self.y_size.0, self.y_size.1)
-                    };
-                    let cb = egui_wgpu::Callback::new_paint_callback(
-                        rect,
-                        PreviewYuvCallback { y_tex: y, uv_tex: uv, fmt, use_uint, w: tex_w, h: tex_h },
-                    );
-                    ui.painter().add(cb);
-                    self.decode_mgr.increment_draws(&src.path);
-
-                    // Show HUD overlay on successful draw
-                    let hud = self.decode_mgr.hud(&src.path, t_sec as f64);
-                    painter.text(rect.left_top() + egui::vec2(5.0, 5.0), egui::Align2::LEFT_TOP, hud, egui::FontId::monospace(10.0), egui::Color32::WHITE);
                 } else {
-                    // No YUV textures available: render HUD instead of black screen
-                    let hud = self.decode_mgr.hud(&src.path, t_sec as f64);
-                    painter.text(rect.center(), egui::Align2::CENTER_CENTER, hud, egui::FontId::monospace(12.0), egui::Color32::LIGHT_GRAY);
+                    if let Some((fmt, y_tex, uv_tex)) = self.preview.current_plane_textures() {
+                        eprintln!("[PREVIEW] reuse last=fmt {:?} size={}x{}", fmt, self.preview.y_size.0, self.preview.y_size.1);
+                        let use_uint = matches!(fmt, YuvPixFmt::P010) && !device_supports_16bit_norm(&rs);
+                        let cb = egui_wgpu::Callback::new_paint_callback(
+                            rect,
+                            PreviewYuvCallback { y_tex, uv_tex, fmt, use_uint, w: self.preview.y_size.0, h: self.preview.y_size.1, mode: self.preview.shader_mode }
+                        );
+                        ui.painter().add(cb);
+                        let hud = format!(
+                            "state={:?}  queue={}  Δ=--  target={:.3} (reuse)",
+                            self.engine.state, queue_len, media_t
+                        );
+                        painter.text(rect.left_top() + egui::vec2(5.0, 5.0), egui::Align2::LEFT_TOP, hud, egui::FontId::monospace(10.0), egui::Color32::WHITE);
+                    } else {
+                        eprintln!("[PREVIEW] fallback=solid dummy=1x1");
+                        let device = &*rs.device;
+                        let y_tex = std::sync::Arc::new(device.create_texture(&eframe::wgpu::TextureDescriptor { label: Some("dummy_y"), size: eframe::wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 }, mip_level_count: 1, sample_count: 1, dimension: eframe::wgpu::TextureDimension::D2, format: eframe::wgpu::TextureFormat::R8Unorm, usage: eframe::wgpu::TextureUsages::TEXTURE_BINDING | eframe::wgpu::TextureUsages::COPY_DST, view_formats: &[] }));
+                        let uv_tex = std::sync::Arc::new(device.create_texture(&eframe::wgpu::TextureDescriptor { label: Some("dummy_uv"), size: eframe::wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 }, mip_level_count: 1, sample_count: 1, dimension: eframe::wgpu::TextureDimension::D2, format: eframe::wgpu::TextureFormat::Rg8Unorm, usage: eframe::wgpu::TextureUsages::TEXTURE_BINDING | eframe::wgpu::TextureUsages::COPY_DST, view_formats: &[] }));
+                        let cb = egui_wgpu::Callback::new_paint_callback(rect, PreviewYuvCallback { y_tex, uv_tex, fmt: YuvPixFmt::Nv12, use_uint: false, w: 1, h: 1, mode: PreviewShaderMode::Solid });
+                        ui.painter().add(cb);
+                        let hud = format!("state={:?}  queue={}  Δ=--  target={:.3}", self.engine.state, queue_len, media_t);
+                        painter.text(rect.left_top() + egui::vec2(5.0, 5.0), egui::Align2::LEFT_TOP, hud, egui::FontId::monospace(10.0), egui::Color32::WHITE);
+                    }
                 }
             } else {
                 painter.text(rect.center(), egui::Align2::CENTER_CENTER, "No WGPU state", egui::FontId::proportional(16.0), egui::Color32::GRAY);
@@ -562,7 +1024,7 @@ impl App {
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         // Optimized repaint pacing: adaptive frame rate based on activity
-        if self.playing {
+        if self.engine.state == PlayState::Playing {
             let fps = (self.seq.fps.num.max(1) as f64) / (self.seq.fps.den.max(1) as f64);
             let dt = if fps > 0.0 { 1.0 / fps } else { 1.0 / 30.0 };
             ctx.request_repaint_after(Duration::from_secs_f64(dt));
@@ -570,14 +1032,26 @@ impl eframe::App for App {
             // When not playing, only repaint when needed (scrubbing, UI changes)
             // This reduces CPU usage significantly when idle
         }
-        // Space toggles play/pause
+        // Space toggles play/pause (keep engine.state in sync)
         if ctx.input(|i| i.key_pressed(egui::Key::Space)) {
-            if self.playing { self.playing = false; }
-            else {
+            let seq_fps = (self.seq.fps.num.max(1) as f64) / (self.seq.fps.den.max(1) as f64);
+            let current_sec = (self.playhead as f64) / seq_fps;
+
+            if self.playback_clock.playing {
+                self.playback_clock.pause(current_sec);
+                // NEW: make the decode engine pause too
+                self.engine.state = PlayState::Paused;
+            } else {
                 if self.playhead >= self.seq.duration_in_frames { self.playhead = 0; }
-                self.playing = true;
-                self.last_tick = Some(Instant::now());
+                self.playback_clock.play(current_sec);
+                // NEW: make the decode engine actually play
+                self.engine.state = PlayState::Playing;
             }
+        }
+
+        // Keep engine.state aligned with the clock unless we're in an explicit drag/seek
+        if !matches!(self.engine.state, PlayState::Scrubbing | PlayState::Seeking) {
+            self.engine.state = if self.playback_clock.playing { PlayState::Playing } else { PlayState::Paused };
         }
         egui::TopBottomPanel::top("top").show(ctx, |ui| {
             ui.horizontal(|ui| {
@@ -593,8 +1067,16 @@ impl eframe::App for App {
                     self.show_jobs = !self.show_jobs;
                 }
                 ui.separator();
-                if ui.button(if self.playing { "Pause (Space)" } else { "Play (Space)" }).clicked() {
-                    if self.playing { self.playing = false; } else { self.playing = true; self.last_tick = Some(Instant::now()); }
+                if ui.button(if self.engine.state == PlayState::Playing { "Pause (Space)" } else { "Play (Space)" }).clicked() {
+                    let seq_fps = (self.seq.fps.num.max(1) as f64) / (self.seq.fps.den.max(1) as f64);
+                    let current_sec = (self.playhead as f64) / seq_fps;
+                    if self.engine.state == PlayState::Playing {
+                        self.playback_clock.pause(current_sec);
+                        self.engine.state = PlayState::Paused;
+                    } else {
+                        self.playback_clock.play(current_sec);
+                        self.engine.state = PlayState::Playing;
+                    }
                 }
             });
         });
@@ -765,6 +1247,69 @@ impl eframe::App for App {
                 });
         });
 
+        // Properties panel for selected clip
+        egui::SidePanel::right("properties").default_width(280.0).show(ctx, |ui| {
+            ui.heading("Properties");
+            if let Some((ti, ii)) = self.selected {
+                if ti < self.seq.tracks.len() && ii < self.seq.tracks[ti].items.len() {
+                    let item = &mut self.seq.tracks[ti].items[ii];
+                    ui.label(format!("Clip ID: {}", &item.id[..8.min(item.id.len())]));
+                    ui.label(format!("From: {}  Dur: {}f", item.from, item.duration_in_frames));
+                    match &mut item.kind {
+                        ItemKind::Video { in_offset_sec, rate, .. } => {
+                            ui.separator();
+                            ui.label("Video");
+                            ui.horizontal(|ui| {
+                                ui.label("Rate");
+                                let mut r = *rate as f64;
+                                if ui.add(egui::DragValue::new(&mut r).clamp_range(0.05..=8.0).speed(0.02)).changed() {
+                                    *rate = (r as f32).max(0.01);
+                                }
+                                if ui.small_button("1.0").on_hover_text("Reset").clicked() { *rate = 1.0; }
+                            });
+                            ui.horizontal(|ui| {
+                                ui.label("In Offset (s)");
+                                let mut o = *in_offset_sec;
+                                if ui.add(egui::DragValue::new(&mut o).clamp_range(0.0..=1_000_000.0).speed(0.01)).changed() {
+                                    *in_offset_sec = o.max(0.0);
+                                }
+                                if ui.small_button("0").on_hover_text("Reset").clicked() { *in_offset_sec = 0.0; }
+                            });
+                        }
+                        ItemKind::Audio { in_offset_sec, rate, .. } => {
+                            ui.separator();
+                            ui.label("Audio");
+                            ui.horizontal(|ui| {
+                                ui.label("Rate");
+                                let mut r = *rate as f64;
+                                if ui.add(egui::DragValue::new(&mut r).clamp_range(0.05..=8.0).speed(0.02)).changed() {
+                                    *rate = (r as f32).max(0.01);
+                                }
+                                if ui.small_button("1.0").on_hover_text("Reset").clicked() { *rate = 1.0; }
+                            });
+                            ui.horizontal(|ui| {
+                                ui.label("In Offset (s)");
+                                let mut o = *in_offset_sec;
+                                if ui.add(egui::DragValue::new(&mut o).clamp_range(0.0..=1_000_000.0).speed(0.01)).changed() {
+                                    *in_offset_sec = o.max(0.0);
+                                }
+                                if ui.small_button("0").on_hover_text("Reset").clicked() { *in_offset_sec = 0.0; }
+                            });
+                        }
+                        ItemKind::Image { .. } => {
+                            ui.separator();
+                            ui.label("Image clip has no time controls");
+                        }
+                        _ => {}
+                    }
+                } else {
+                    ui.label("Selection out of range");
+                }
+            } else {
+                ui.label("No clip selected");
+            }
+        });
+
         egui::CentralPanel::default().show(ctx, |ui| {
             egui::Resize::default()
                 .id_salt("preview_resize")
@@ -830,24 +1375,22 @@ impl eframe::App for App {
             });
         }
 
-        // Audio playback follows play state
-        if self.playing {
-            let fps = self.seq.fps.num.max(1) as f32 / self.seq.fps.den.max(1) as f32;
-            let t_sec = self.playhead as f32 / fps;
-            // pick audio clip at playhead or audio from current video
-            let mut src_path: Option<String> = None;
-            // search audio tracks first
-            'outer: for track in self.seq.tracks.iter().rev() {
-                for it in &track.items {
-                    let covers = self.playhead >= it.from && self.playhead < it.from + it.duration_in_frames;
-                    if !covers { continue; }
-                    if let ItemKind::Audio { src } = &it.kind { src_path = Some(src.clone()); break 'outer; }
-                }
+        // Audio playback follows play state using active audio mapping
+        if self.engine.state == PlayState::Playing {
+            let t_sec = self.playback_clock.now();
+            if let Some((path, media_sec)) = active_audio_media_time(&self.seq, t_sec) {
+                self.audio.ensure_playing(Some(&path), media_sec);
+            } else {
+                self.audio.stop();
             }
-            if src_path.is_none() {
-                if let Some(v) = current_visual_source(&self.seq, self.playhead) { if !v.is_image { src_path = Some(v.path); } }
+        } else if self.scrub_audio_active || self.engine.state == PlayState::Scrubbing || self.engine.state == PlayState::Seeking {
+            // Audible scrubbing while paused
+            let t_sec = self.playback_clock.now();
+            if let Some((path, media_sec)) = active_audio_media_time(&self.seq, t_sec) {
+                self.audio.preview_scrub(Some(&path), media_sec);
+            } else {
+                self.audio.stop();
             }
-            self.audio.ensure_playing(src_path.as_deref(), t_sec as f64);
         } else {
             self.audio.stop();
         }
@@ -884,6 +1427,47 @@ fn current_visual_source(seq: &Sequence, playhead: i64) -> Option<VisualSource> 
     }
     None
 }
+
+fn active_video_media_time(seq: &Sequence, timeline_sec: f64) -> Option<(String, f64)> {
+    let seq_fps = (seq.fps.num.max(1) as f64) / (seq.fps.den.max(1) as f64);
+    let playhead = (timeline_sec * seq_fps).round() as i64;
+    for track in seq.tracks.iter().rev() {
+        for it in &track.items {
+            let covers = playhead >= it.from && playhead < it.from + it.duration_in_frames;
+            if !covers { continue; }
+            if let ItemKind::Video { src, in_offset_sec, rate, .. } = &it.kind {
+                let start_on_timeline_sec = it.from as f64 / seq_fps;
+                let local_t = (timeline_sec - start_on_timeline_sec).max(0.0);
+                let media_sec = *in_offset_sec + local_t * (*rate as f64);
+                return Some((src.clone(), media_sec.max(0.0)));
+            }
+        }
+    }
+    None
+}
+
+fn active_audio_media_time(seq: &Sequence, timeline_sec: f64) -> Option<(String, f64)> {
+    let seq_fps = (seq.fps.num.max(1) as f64) / (seq.fps.den.max(1) as f64);
+    let playhead = (timeline_sec * seq_fps).round() as i64;
+    for track in seq.tracks.iter().rev() {
+        for it in &track.items {
+            let covers = playhead >= it.from && playhead < it.from + it.duration_in_frames;
+            if !covers { continue; }
+            if let ItemKind::Audio { src, in_offset_sec, rate } = &it.kind {
+                let start_on_timeline_sec = it.from as f64 / seq_fps;
+                let local_t = (timeline_sec - start_on_timeline_sec).max(0.0);
+                let media_sec = *in_offset_sec + local_t * (*rate as f64);
+                return Some((src.clone(), media_sec.max(0.0)));
+            }
+        }
+    }
+    active_video_media_time(seq, timeline_sec)
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum PreviewShaderMode { Solid, ShowY, UvDebug, Nv12 }
+
+impl Default for PreviewShaderMode { fn default() -> Self { PreviewShaderMode::Solid } }
 
 struct PreviewState {
     // Efficient frame cache with LRU eviction
@@ -931,12 +1515,31 @@ struct PreviewState {
     gpu_yuv: Option<native_decoder::GpuYuv>,
     #[cfg(target_os = "macos")]
     zc_size: (u32, u32),
+    #[cfg(target_os = "macos")]
+    zc_logged: bool,
+
+    // Last-presented zero-copy textures (macOS reuse)
+    #[cfg(target_os = "macos")]
+    last_zc: Option<(YuvPixFmt, std::sync::Arc<eframe::wgpu::Texture>, std::sync::Arc<eframe::wgpu::Texture>, (u32,u32))>,
+
+    // Recency tracking for reuse selection
+    last_present_tick: u64,
+    last_cpu_tick: u64,
+    #[cfg(target_os = "macos")]
+    last_zc_tick: u64,
 
     // Performance metrics
     cache_hits: u64,
     cache_misses: u64,
     decode_time_ms: f64,
+    // Debug shader mode for preview
+    // Last presented YUV format (for reuse without new uploads)
+    last_fmt: Option<YuvPixFmt>,
+    shader_mode: PreviewShaderMode,
 }
+
+// Log guard: avoid spamming size mismatch logs across frames
+static PRESENT_SIZE_MISMATCH_LOGGED: OnceLock<AtomicBool> = OnceLock::new();
 
 impl PreviewState {
     fn new() -> Self {
@@ -976,6 +1579,16 @@ impl PreviewState {
             gpu_yuv: None,
             #[cfg(target_os = "macos")]
             zc_size: (0, 0),
+            #[cfg(target_os = "macos")]
+            zc_logged: false,
+            #[cfg(target_os = "macos")]
+            last_zc: None,
+            last_present_tick: 0,
+            last_cpu_tick: 0,
+            #[cfg(target_os = "macos")]
+            last_zc_tick: 0,
+            last_fmt: None,
+            shader_mode: PreviewShaderMode::Nv12,
         }
     }
 
@@ -1083,7 +1696,10 @@ impl PreviewState {
         let queue = &*rs.queue;
         let device = &*rs.device;
         let next_idx = (self.ring_write + 1) % 3;
-        if next_idx == self.ring_present { return; } // drop frame rather than stall
+        if next_idx == self.ring_present {
+            eprintln!("[RING DROP] write={} present={} (dropping frame to avoid stall)", self.ring_write, self.ring_present);
+            return;
+        }
         let idx = self.ring_write % 3;
         let y_tex = self.y_tex[idx].as_ref().map(|a| &**a).unwrap();
         let uv_tex = self.uv_tex[idx].as_ref().map(|a| &**a).unwrap();
@@ -1096,16 +1712,14 @@ impl PreviewState {
         let y_pad_bpr = self.y_pad_bpr;
         let uv_pad_bpr = self.uv_pad_bpr;
 
-        // Fill pre-allocated scratch buffers with row padding
-        let mut y_scratch: Vec<u8> = Vec::with_capacity(y_pad_bpr * h as usize);
-        unsafe { y_scratch.set_len(y_pad_bpr * h as usize); }
+        // Fill pre-allocated scratch buffers with row padding, zero-initialized
+        let mut y_scratch = vec![0u8; y_pad_bpr * h as usize];
         for r in 0..(h as usize) {
             let s = r * y_bpr;
             let d = r * y_pad_bpr;
             y_scratch[d..d + y_bpr].copy_from_slice(&y[s..s + y_bpr]);
         }
-        let mut uv_scratch: Vec<u8> = Vec::with_capacity(uv_pad_bpr * uv_h as usize);
-        unsafe { uv_scratch.set_len(uv_pad_bpr * uv_h as usize); }
+        let mut uv_scratch = vec![0u8; uv_pad_bpr * uv_h as usize];
         for r in 0..(uv_h as usize) {
             let s = r * uv_bpr;
             let d = r * uv_pad_bpr;
@@ -1135,9 +1749,46 @@ impl PreviewState {
             eframe::wgpu::Extent3d { width: uv_w, height: uv_h, depth_or_array_layers: 1 },
         );
         queue.submit([encoder.finish()]);
+        eprintln!("[UV] w={} h={} bpr={} rows={}", uv_w, uv_h, uv_pad_bpr, uv_h);
 
         self.ring_present = idx;
         self.ring_write = next_idx;
+        self.last_fmt = Some(fmt);
+    }
+
+    fn current_plane_textures(&self) -> Option<(YuvPixFmt, std::sync::Arc<eframe::wgpu::Texture>, std::sync::Arc<eframe::wgpu::Texture>)> {
+        let mut best: Option<(u64, YuvPixFmt, std::sync::Arc<eframe::wgpu::Texture>, std::sync::Arc<eframe::wgpu::Texture>)> = None;
+        if let Some(fmt) = self.last_fmt {
+            let idx = self.ring_present % 3;
+            if let (Some(y), Some(uv)) = (self.y_tex[idx].as_ref(), self.uv_tex[idx].as_ref()) {
+                best = Some((self.last_cpu_tick, fmt, y.clone(), uv.clone()));
+            }
+        }
+        #[cfg(target_os = "macos")]
+        if let Some((fmt, y, uv, _sz)) = self.last_zc.as_ref() {
+            match best {
+                Some((tick, ..)) if self.last_zc_tick <= tick => {}
+                _ => { best = Some((self.last_zc_tick, *fmt, y.clone(), uv.clone())); }
+            }
+        }
+        best.map(|(_, fmt, y, uv)| (fmt, y, uv))
+    }
+
+    #[cfg(target_os = "macos")]
+    fn set_last_zc_present(
+        &mut self,
+        fmt: YuvPixFmt,
+        y_tex: std::sync::Arc<eframe::wgpu::Texture>,
+        uv_tex: std::sync::Arc<eframe::wgpu::Texture>,
+        w: u32,
+        h: u32,
+    ) {
+        self.last_zc = Some((fmt, y_tex, uv_tex, (w, h)));
+        self.last_fmt = Some(fmt);
+        self.y_size = (w, h);
+        self.uv_size = ((w + 1)/2, (h + 1)/2);
+        self.last_present_tick = self.last_present_tick.wrapping_add(1);
+        self.last_zc_tick = self.last_present_tick;
     }
 
     fn present_yuv(&mut self, rs: &eframe::egui_wgpu::RenderState, path: &str, t_sec: f64) -> Option<(YuvPixFmt, Arc<eframe::wgpu::Texture>, Arc<eframe::wgpu::Texture>)> {
@@ -1494,6 +2145,107 @@ impl PreviewState {
         self.present_yuv(rs, path, t_sec)
     }
 
+    fn present_yuv_from_bytes(
+        &mut self,
+        rs: &eframe::egui_wgpu::RenderState,
+        fmt: YuvPixFmt,
+        y_bytes: &[u8],
+        uv_bytes: &[u8],
+        w: u32,
+        h: u32,
+    ) -> Option<(YuvPixFmt, Arc<eframe::wgpu::Texture>, Arc<eframe::wgpu::Texture>)> {
+        // Ensure textures/buffers exist at this decoded size/format
+        self.ensure_yuv_textures(rs, w, h, fmt);
+
+        // Write into current ring slot
+        let wi = self.ring_write % 3;
+
+        // Compute padded rows
+        let (y_bpp, uv_bpp_per_texel) = match fmt { YuvPixFmt::Nv12 => (1usize, 2usize), YuvPixFmt::P010 => (2usize, 4usize) };
+        let y_w = w as usize; let y_h = h as usize;
+        let uv_w = ((w + 1) / 2) as usize; let uv_h = ((h + 1) / 2) as usize;
+        let y_pad_bpr = align_to(y_w * y_bpp, eframe::wgpu::COPY_BYTES_PER_ROW_ALIGNMENT as usize);
+        let uv_pad_bpr = align_to(uv_w * uv_bpp_per_texel, eframe::wgpu::COPY_BYTES_PER_ROW_ALIGNMENT as usize);
+        debug_assert!(uv_pad_bpr % 2 == 0, "NV12 UV bpr must be even (#channels=2)");
+
+        // Guard: verify plane lengths once; early out if mismatched
+        let expected_y = y_w * y_bpp * y_h;
+        let expected_uv = uv_w * uv_bpp_per_texel * uv_h;
+        debug_assert_eq!(y_bytes.len(), expected_y, "Y plane size mismatch");
+        debug_assert_eq!(uv_bytes.len(), expected_uv, "UV plane size mismatch");
+        if y_bytes.len() != expected_y || uv_bytes.len() != expected_uv {
+            let flag = PRESENT_SIZE_MISMATCH_LOGGED.get_or_init(|| AtomicBool::new(false));
+            if !flag.swap(true, Ordering::Relaxed) {
+                eprintln!(
+                    "[present] size mismatch: got Y={} UV={}, expected Y={} UV={}",
+                    y_bytes.len(), uv_bytes.len(), expected_y, expected_uv
+                );
+            }
+            return None;
+        }
+
+        let device = &*rs.device;
+        let queue = &*rs.queue;
+
+        // Upload Y
+        if let (Some(stage), Some(y_tex)) = (self.y_stage[wi].as_ref(), self.y_tex[wi].as_ref()) {
+            if y_pad_bpr == y_w * y_bpp {
+                queue.write_buffer(stage, 0, y_bytes);
+            } else {
+                let mut padded = vec![0u8; y_pad_bpr * y_h];
+                for row in 0..y_h {
+                    let src_off = row * y_w * y_bpp;
+                    let dst_off = row * y_pad_bpr;
+                    padded[dst_off..dst_off + y_w * y_bpp].copy_from_slice(&y_bytes[src_off..src_off + y_w * y_bpp]);
+                }
+                queue.write_buffer(stage, 0, &padded);
+            }
+            let mut enc = device.create_command_encoder(&eframe::wgpu::CommandEncoderDescriptor { label: Some("copy_y") });
+            enc.copy_buffer_to_texture(
+                eframe::wgpu::ImageCopyBuffer { buffer: stage, layout: eframe::wgpu::ImageDataLayout { offset: 0, bytes_per_row: Some(y_pad_bpr as u32), rows_per_image: Some(h) } },
+                eframe::wgpu::ImageCopyTexture { texture: y_tex, mip_level: 0, origin: eframe::wgpu::Origin3d::ZERO, aspect: eframe::wgpu::TextureAspect::All },
+                eframe::wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+            );
+            rs.queue.submit(std::iter::once(enc.finish()));
+        }
+
+        // Upload UV
+        if let (Some(stage), Some(uv_tex)) = (self.uv_stage[wi].as_ref(), self.uv_tex[wi].as_ref()) {
+            if uv_pad_bpr == uv_w * uv_bpp_per_texel {
+                queue.write_buffer(stage, 0, uv_bytes);
+            } else {
+                let mut padded = vec![0u8; uv_pad_bpr * uv_h];
+                for row in 0..uv_h {
+                    let src_off = row * uv_w * uv_bpp_per_texel;
+                    let dst_off = row * uv_pad_bpr;
+                    padded[dst_off..dst_off + uv_w * uv_bpp_per_texel].copy_from_slice(&uv_bytes[src_off..src_off + uv_w * uv_bpp_per_texel]);
+                }
+                queue.write_buffer(stage, 0, &padded);
+            }
+            let mut enc = device.create_command_encoder(&eframe::wgpu::CommandEncoderDescriptor { label: Some("copy_uv") });
+            enc.copy_buffer_to_texture(
+                eframe::wgpu::ImageCopyBuffer { buffer: stage, layout: eframe::wgpu::ImageDataLayout { offset: 0, bytes_per_row: Some(uv_pad_bpr as u32), rows_per_image: Some((h + 1) / 2) } },
+                eframe::wgpu::ImageCopyTexture { texture: uv_tex, mip_level: 0, origin: eframe::wgpu::Origin3d::ZERO, aspect: eframe::wgpu::TextureAspect::All },
+                eframe::wgpu::Extent3d { width: (w + 1) / 2, height: (h + 1) / 2, depth_or_array_layers: 1 },
+            );
+            rs.queue.submit(std::iter::once(enc.finish()));
+            eprintln!("[UV] w={} h={} bpr={} rows={}", uv_w, uv_h, uv_pad_bpr, uv_h);
+        }
+
+        // Persist last-good so fallback can reuse
+        self.last_fmt = Some(fmt);
+        self.y_size = (w, h);
+        self.uv_size = ((w + 1) / 2, (h + 1) / 2);
+        self.ring_present = wi;
+        self.ring_write = (wi + 1) % 3;
+        self.last_present_tick = self.last_present_tick.wrapping_add(1);
+        self.last_cpu_tick = self.last_present_tick;
+
+        let y_tex = self.y_tex[wi].as_ref()?.clone();
+        let uv_tex = self.uv_tex[wi].as_ref()?.clone();
+        Some((fmt, y_tex, uv_tex))
+    }
+
     #[cfg(target_os = "macos")]
     fn present_nv12_zero_copy(
         &mut self,
@@ -1501,13 +2253,20 @@ impl PreviewState {
         zc: &native_decoder::IOSurfaceFrame,
     ) -> Option<(YuvPixFmt, Arc<eframe::wgpu::Texture>, Arc<eframe::wgpu::Texture>)> {
         self.ensure_zero_copy_nv12_textures(rs, zc.width, zc.height);
-        if let Some(ref yuv) = self.gpu_yuv {
+        if let Some((y_arc, uv_arc)) = self.gpu_yuv.as_ref().map(|g| (g.y_tex.clone(), g.uv_tex.clone())) {
             let queue = &*rs.queue;
-            if let Err(e) = yuv.import_from_iosurface(queue, zc) {
+            if let Err(e) = self.gpu_yuv.as_ref().unwrap().import_from_iosurface(queue, zc) {
                 eprintln!("[zc] import_from_iosurface error: {}", e);
                 return None;
             }
-            return Some((YuvPixFmt::Nv12, yuv.y_tex.clone(), yuv.uv_tex.clone()));
+            #[cfg(target_os = "macos")]
+            if !self.zc_logged {
+                tracing::info!("[preview] imported NV12 planes: Y={}x{}  UV={}x{}", zc.width, zc.height, (zc.width + 1)/2, (zc.height + 1)/2);
+                self.zc_logged = true;
+            }
+            // Persist last ZC for reuse
+            self.set_last_zc_present(YuvPixFmt::Nv12, y_arc.clone(), uv_arc.clone(), zc.width, zc.height);
+            return Some((YuvPixFmt::Nv12, y_arc, uv_arc));
         }
         None
     }
@@ -1521,10 +2280,23 @@ struct PreviewYuvCallback {
     use_uint: bool,
     w: u32,
     h: u32,
+    mode: PreviewShaderMode,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct PreviewUniforms {
+    w: f32,
+    h: f32,
+    mode: u32, // 0=Solid,1=ShowY,2=UvDebug,3=Nv12
+    _pad: u32, // 16B alignment
 }
 
 struct Nv12Resources {
-    pipeline: eframe::wgpu::RenderPipeline,
+    pipeline_nv12: eframe::wgpu::RenderPipeline,
+    pipeline_solid: eframe::wgpu::RenderPipeline,
+    pipeline_showy: eframe::wgpu::RenderPipeline,
+    pipeline_uvdebug: eframe::wgpu::RenderPipeline,
     bind_group_layout: eframe::wgpu::BindGroupLayout,
     uniform_bgl: eframe::wgpu::BindGroupLayout,
     sampler: eframe::wgpu::Sampler,
@@ -1558,8 +2330,10 @@ impl egui_wgpu::CallbackTrait for PreviewYuvCallback {
                 @group(0) @binding(0) var samp: sampler;
                 @group(0) @binding(1) var texY: texture_2d<f32>;
                 @group(0) @binding(2) var texUV: texture_2d<f32>;
+                struct Uniforms { w: f32, h: f32, mode: u32, _pad: u32 };
+                @group(0) @binding(3) var<uniform> uni: Uniforms;
 
-                struct Conv { y_offset: f32, y_scale: f32, c_offset: f32, c_scale: f32, _pad: vec2<f32> };
+                struct Conv { y_bias: f32, y_scale: f32, uv_bias: f32, uv_scale: f32 };
                 @group(1) @binding(0) var<uniform> conv: Conv;
 
                 struct VSOut { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> };
@@ -1576,16 +2350,31 @@ impl egui_wgpu::CallbackTrait for PreviewYuvCallback {
 
                 @fragment
                 fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
-                    let y = textureSample(texY, samp, in.uv).r;
-                    let uv = textureSample(texUV, samp, in.uv).rg;
-                    // Limited-range conversion parameters via uniform
-                    let y709 = max(y - conv.y_offset, 0.0) * conv.y_scale;
-                    let u = (uv.x - conv.c_offset) * conv.c_scale;
-                    let v = (uv.y - conv.c_offset) * conv.c_scale;
-                    let r = y709 + 1.5748 * v;
-                    let g = y709 - 0.1873 * u - 0.4681 * v;
-                    let b = y709 + 1.8556 * u;
-                    return vec4<f32>(r, g, b, 1.0);
+                    let tc = in.uv;
+                    switch uni.mode {
+                        case 0u: { // Solid
+                            return vec4<f32>(0.0, 1.0, 0.0, 1.0);
+                        }
+                        case 1u: { // ShowY
+                            let y = textureSampleLevel(texY, samp, tc, 0.0).r;
+                            return vec4<f32>(y, y, y, 1.0);
+                        }
+                        case 2u: { // UvDebug
+                            let uv = textureSampleLevel(texUV, samp, tc, 0.0).rg;
+                            return vec4<f32>(uv.x, uv.y, 0.0, 1.0);
+                        }
+                        default: { // NV12 using BT.709 limited range conv
+                            let y = textureSampleLevel(texY, samp, tc, 0.0).r;
+                            let uv = textureSampleLevel(texUV, samp, tc, 0.0).rg;
+                            let C = max((y - conv.y_bias) * conv.y_scale, 0.0);
+                            let D = (uv.x - conv.uv_bias) * conv.uv_scale;
+                            let E = (uv.y - conv.uv_bias) * conv.uv_scale;
+                            let r = clamp(C + 1.5748 * E,              0.0, 1.0);
+                            let g = clamp(C - 0.1873 * D - 0.4681 * E, 0.0, 1.0);
+                            let b = clamp(C + 1.8556 * D,              0.0, 1.0);
+                            return vec4<f32>(r, g, b, 1.0);
+                        }
+                    }
                 }
             "#;
             let module = device.create_shader_module(eframe::wgpu::ShaderModuleDescriptor {
@@ -1593,8 +2382,14 @@ impl egui_wgpu::CallbackTrait for PreviewYuvCallback {
                 source: eframe::wgpu::ShaderSource::Wgsl(shader_src.into()),
             });
             let bgl = device.create_bind_group_layout(&eframe::wgpu::BindGroupLayoutDescriptor {
-                label: Some("preview_nv12_bgl"),
+                label: Some("NV12 tex BGL"),
                 entries: &[
+                    eframe::wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: eframe::wgpu::ShaderStages::FRAGMENT,
+                        ty: eframe::wgpu::BindingType::Sampler(eframe::wgpu::SamplerBindingType::Filtering),
+                        count: None,
+                    },
                     eframe::wgpu::BindGroupLayoutEntry {
                         binding: 1,
                         visibility: eframe::wgpu::ShaderStages::FRAGMENT,
@@ -1616,15 +2411,19 @@ impl egui_wgpu::CallbackTrait for PreviewYuvCallback {
                         count: None,
                     },
                     eframe::wgpu::BindGroupLayoutEntry {
-                        binding: 0,
+                        binding: 3,
                         visibility: eframe::wgpu::ShaderStages::FRAGMENT,
-                        ty: eframe::wgpu::BindingType::Sampler(eframe::wgpu::SamplerBindingType::Filtering),
+                        ty: eframe::wgpu::BindingType::Buffer {
+                            ty: eframe::wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
                         count: None,
                     },
                 ],
             });
             let uniform_bgl = device.create_bind_group_layout(&eframe::wgpu::BindGroupLayoutDescriptor {
-                label: Some("preview_nv12_uniform_bgl"),
+                label: Some("NV12 conv BGL"),
                 entries: &[eframe::wgpu::BindGroupLayoutEntry {
                     binding: 0,
                     visibility: eframe::wgpu::ShaderStages::FRAGMENT,
@@ -1633,12 +2432,12 @@ impl egui_wgpu::CallbackTrait for PreviewYuvCallback {
                 }],
             });
             let pl = device.create_pipeline_layout(&eframe::wgpu::PipelineLayoutDescriptor {
-                label: Some("preview_nv12_pl"),
+                label: Some("NV12 pipeline layout"),
                 bind_group_layouts: &[&bgl, &uniform_bgl],
                 push_constant_ranges: &[],
             });
-            let pipeline = device.create_render_pipeline(&eframe::wgpu::RenderPipelineDescriptor {
-                label: Some("preview_nv12_pipeline"),
+            let mk_pipeline = |label: &str, fs: &str| device.create_render_pipeline(&eframe::wgpu::RenderPipelineDescriptor {
+                label: Some(label),
                 layout: Some(&pl),
                 vertex: eframe::wgpu::VertexState {
                     module: &module,
@@ -1648,11 +2447,11 @@ impl egui_wgpu::CallbackTrait for PreviewYuvCallback {
                 },
                 fragment: Some(eframe::wgpu::FragmentState {
                     module: &module,
-                    entry_point: "fs_main",
+                    entry_point: fs,
                     compilation_options: eframe::wgpu::PipelineCompilationOptions::default(),
                     targets: &[Some(eframe::wgpu::ColorTargetState {
                         format: eframe::wgpu::TextureFormat::Bgra8Unorm,
-                        blend: Some(eframe::wgpu::BlendState::ALPHA_BLENDING),
+                        blend: Some(eframe::wgpu::BlendState::REPLACE),
                         write_mask: eframe::wgpu::ColorWrites::ALL,
                     })],
                 }),
@@ -1662,9 +2461,22 @@ impl egui_wgpu::CallbackTrait for PreviewYuvCallback {
                 multiview: None,
                 cache: None,
             });
-            let sampler = device.create_sampler(&eframe::wgpu::SamplerDescriptor::default());
+            let pipeline_nv12 = mk_pipeline("preview_nv12_pipeline", "fs_main");
+            let pipeline_solid = mk_pipeline("preview_solid_pipeline", "fs_main");
+            let pipeline_showy = mk_pipeline("preview_showy_pipeline", "fs_main");
+            let pipeline_uvdebug = mk_pipeline("preview_uvdebug_pipeline", "fs_main");
+            let sampler = device.create_sampler(&eframe::wgpu::SamplerDescriptor {
+                label: Some("nv12_clamp_sampler"),
+                address_mode_u: eframe::wgpu::AddressMode::ClampToEdge,
+                address_mode_v: eframe::wgpu::AddressMode::ClampToEdge,
+                address_mode_w: eframe::wgpu::AddressMode::ClampToEdge,
+                mag_filter: eframe::wgpu::FilterMode::Linear,
+                min_filter: eframe::wgpu::FilterMode::Linear,
+                mipmap_filter: eframe::wgpu::FilterMode::Nearest,
+                ..Default::default()
+            });
             // Take ownership values, then insert to avoid overlapping borrows during insert
-            let res = Nv12Resources { pipeline, bind_group_layout: bgl, uniform_bgl, sampler };
+            let res = Nv12Resources { pipeline_nv12, pipeline_solid, pipeline_showy, pipeline_uvdebug, bind_group_layout: bgl, uniform_bgl, sampler };
             resources.insert(res);
         }
 
@@ -1730,30 +2542,46 @@ impl egui_wgpu::CallbackTrait for PreviewYuvCallback {
         }
 
         // Float NV12/P010 bind groups and uniform
+        // Always refresh to avoid stale texture bindings during playback/scrub
         let y_id = Arc::as_ptr(&self.y_tex) as usize;
         let uv_id = Arc::as_ptr(&self.uv_tex) as usize;
-        let rebuild = resources.get::<Nv12BindGroup>().map_or(true, |bg| bg.y_id != y_id || bg.uv_id != uv_id);
-        if rebuild {
-            let view_y = self.y_tex.create_view(&eframe::wgpu::TextureViewDescriptor::default());
-            let view_uv = self.uv_tex.create_view(&eframe::wgpu::TextureViewDescriptor::default());
-            let (nv_bgl, nv_samp) = {
-                let r = resources.get::<Nv12Resources>().unwrap();
-                (&r.bind_group_layout, &r.sampler)
-            };
-            let bind = device.create_bind_group(&eframe::wgpu::BindGroupDescriptor { label: Some("preview_nv12_bg"), layout: nv_bgl, entries: &[eframe::wgpu::BindGroupEntry { binding: 0, resource: eframe::wgpu::BindingResource::Sampler(nv_samp) }, eframe::wgpu::BindGroupEntry { binding: 1, resource: eframe::wgpu::BindingResource::TextureView(&view_y) }, eframe::wgpu::BindGroupEntry { binding: 2, resource: eframe::wgpu::BindingResource::TextureView(&view_uv) }] });
-            eprintln!("NV12 bind-group ready ({}x{} / {}x{})", self.w, self.h, (self.w + 1)/2, (self.h + 1)/2);
-            resources.insert(Nv12BindGroup { bind, y_id, uv_id });
-        }
-        // Use limited-range conversion (FFmpeg typically outputs limited-range YUV)
-        // Limited-range: Y 16-235, UV 16-240 (8-bit) or Y 64-940, UV 64-960 (10-bit)
-        let (y_off, y_scale, c_off, c_scale) = match self.fmt { 
-            YuvPixFmt::Nv12 => (16.0/255.0, 1.0/219.0, 128.0/255.0, 1.0/224.0), // Limited-range
-            YuvPixFmt::P010 => (64.0/1023.0, 1.0/876.0, 512.0/1023.0, 1.0/896.0) // Limited-range
+        let view_y = self.y_tex.create_view(&eframe::wgpu::TextureViewDescriptor::default());
+        let view_uv = self.uv_tex.create_view(&eframe::wgpu::TextureViewDescriptor::default());
+        let (nv_bgl, nv_samp) = {
+            let r = resources.get::<Nv12Resources>().unwrap();
+            (&r.bind_group_layout, &r.sampler)
+        };
+        // Preview uniforms (w,h,mode)
+        let mode_u32: u32 = match self.mode { PreviewShaderMode::Solid => 0, PreviewShaderMode::ShowY => 1, PreviewShaderMode::UvDebug => 2, PreviewShaderMode::Nv12 => 3 };
+        let uni = PreviewUniforms { w: self.w as f32, h: self.h as f32, mode: mode_u32, _pad: 0 };
+        let ubuf2 = device.create_buffer(&eframe::wgpu::BufferDescriptor {
+            label: Some("preview_uniforms"),
+            size: std::mem::size_of::<PreviewUniforms>() as u64,
+            usage: eframe::wgpu::BufferUsages::UNIFORM | eframe::wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        queue.write_buffer(&ubuf2, 0, bytemuck::bytes_of(&uni));
+        let bind = device.create_bind_group(&eframe::wgpu::BindGroupDescriptor {
+            label: Some("preview_nv12_bg"),
+            layout: nv_bgl,
+            entries: &[
+                eframe::wgpu::BindGroupEntry { binding: 0, resource: eframe::wgpu::BindingResource::Sampler(nv_samp) },
+                eframe::wgpu::BindGroupEntry { binding: 1, resource: eframe::wgpu::BindingResource::TextureView(&view_y) },
+                eframe::wgpu::BindGroupEntry { binding: 2, resource: eframe::wgpu::BindingResource::TextureView(&view_uv) },
+                eframe::wgpu::BindGroupEntry { binding: 3, resource: eframe::wgpu::BindingResource::Buffer(eframe::wgpu::BufferBinding { buffer: &ubuf2, offset: 0, size: None }) },
+            ],
+        });
+        tracing::debug!("NV12 bind-group refreshed ({}x{} / {}x{})", self.w, self.h, (self.w + 1)/2, (self.h + 1)/2);
+        resources.insert(Nv12BindGroup { bind, y_id, uv_id });
+        // BT.709 limited-range conversion parameters
+        let (y_bias, y_scale, uv_bias, uv_scale) = match self.fmt {
+            YuvPixFmt::Nv12 => (16.0/255.0, 255.0/219.0, 128.0/255.0, 255.0/224.0),
+            YuvPixFmt::P010 => (64.0/1023.0, 1023.0/876.0, 512.0/1023.0, 1023.0/896.0),
         };
         #[repr(C)]
         #[derive(Clone, Copy)]
-        struct ConvStd { y_offset: f32, y_scale: f32, c_offset: f32, c_scale: f32, _pad: [f32;2] }
-        let conv = ConvStd { y_offset: y_off, y_scale, c_offset: c_off, c_scale, _pad: [0.0;2] };
+        struct ConvStd { y_bias: f32, y_scale: f32, uv_bias: f32, uv_scale: f32 }
+        let conv = ConvStd { y_bias, y_scale, uv_bias, uv_scale };
         let ubuf = device.create_buffer(&eframe::wgpu::BufferDescriptor { label: Some("yuv_conv_ubo"), size: std::mem::size_of::<ConvStd>() as u64, usage: eframe::wgpu::BufferUsages::UNIFORM | eframe::wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
         let bytes: &[u8] = unsafe { std::slice::from_raw_parts((&conv as *const ConvStd) as *const u8, std::mem::size_of::<ConvStd>()) };
         queue.write_buffer(&ubuf, 0, bytes);
@@ -1781,7 +2609,11 @@ impl egui_wgpu::CallbackTrait for PreviewYuvCallback {
             let res = resources.get::<Nv12Resources>().expect("nv12 resources");
             let bg = resources.get::<Nv12BindGroup>().expect("nv12 bind group");
             let ubg = resources.get::<ConvBindGroup>().expect("conv bind group");
-            render_pass.set_pipeline(&res.pipeline);
+            // Validate presence before use
+            assert!(resources.get::<Nv12BindGroup>().is_some(), "missing NV12 tex bind group");
+            assert!(resources.get::<ConvBindGroup>().is_some(), "missing conv bind group");
+            // Single pipeline; shader selects the mode via uniform
+            render_pass.set_pipeline(&res.pipeline_nv12);
             render_pass.set_bind_group(0, &bg.bind, &[]);
             render_pass.set_bind_group(1, &ubg.0, &[]);
             render_pass.draw(0..3, 0..1);
@@ -2505,7 +3337,7 @@ fn build_export_timeline(seq: &timeline::Sequence) -> ExportTimeline {
     let mut audio_clips: Vec<AudioClip> = Vec::new();
     for track in &seq.tracks {
         for it in &track.items {
-            if let ItemKind::Audio { src } = &it.kind {
+            if let ItemKind::Audio { src, .. } = &it.kind {
                 audio_clips.push(AudioClip {
                     path: src.clone(),
                     offset_sec: it.from as f32 / fps,
@@ -2544,4 +3376,16 @@ fn detect_hw_encoder<const N: usize>(candidates: [&str; N]) -> Option<String> {
         if s.contains(cand) { return Some(cand.to_string()); }
     }
     None
+}
+#[derive(Clone, Debug)]
+struct AudioPeaks {
+    peaks: Vec<(f32, f32)>, // (min, max) in [-1,1]
+    duration_sec: f32,
+    channels: u16,
+    sample_rate: u32,
+}
+
+#[derive(Default)]
+struct AudioCache {
+    map: std::collections::HashMap<std::path::PathBuf, std::sync::Arc<AudioPeaks>>,
 }

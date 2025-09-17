@@ -17,6 +17,11 @@ use thiserror::Error;
 #[cfg(target_os = "macos")]
 mod macos;
 
+// Ensure the Obj-C shim static library is linked when this crate is used.
+#[cfg(target_os = "macos")]
+#[link(name = "avfoundation_shim", kind = "static")]
+extern "C" {}
+
 #[cfg(target_os = "macos")]
 pub use macos::VideoToolboxDecoder;
 

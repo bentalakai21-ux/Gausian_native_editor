@@ -66,13 +66,13 @@ void avf_vt_invalidate(VTDecompressionSessionRef sess);
 IOSurfaceRef avf_cvpixelbuffer_get_iosurface(void* pixel_buffer);
 const void* avf_create_iosurface_destination_attributes(int width, int height);
 
-// IOSurface plane helpers (read-only)
-size_t avf_iosurface_width_of_plane(IOSurfaceRef s, size_t plane);
-size_t avf_iosurface_height_of_plane(IOSurfaceRef s, size_t plane);
-size_t avf_iosurface_bytes_per_row_of_plane(IOSurfaceRef s, size_t plane);
-const void* avf_iosurface_base_address_of_plane(IOSurfaceRef s, size_t plane);
-void avf_iosurface_lock_readonly(IOSurfaceRef s);
-void avf_iosurface_unlock(IOSurfaceRef s);
+// --- IOSurface plane helpers (used by wgpu_integration.rs) ---
+void avf_iosurface_lock_readonly(IOSurfaceRef surface);
+void avf_iosurface_unlock(IOSurfaceRef surface);
+size_t avf_iosurface_width_of_plane(IOSurfaceRef surface, size_t plane);
+size_t avf_iosurface_height_of_plane(IOSurfaceRef surface, size_t plane);
+size_t avf_iosurface_bytes_per_row_of_plane(IOSurfaceRef surface, size_t plane);
+void*  avf_iosurface_base_address_of_plane(IOSurfaceRef surface, size_t plane);
 
 #ifdef __cplusplus
 }

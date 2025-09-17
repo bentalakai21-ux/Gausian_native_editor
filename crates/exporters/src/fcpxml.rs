@@ -156,7 +156,7 @@ impl FcpXml {
                 // Find matching asset info
                 let asset_info = assets.iter().find(|a| {
                     match &item.kind {
-                        ItemKind::Video { src, .. } | ItemKind::Audio { src } | ItemKind::Image { src } => {
+                        ItemKind::Video { src, .. } | ItemKind::Audio { src, .. } | ItemKind::Image { src } => {
                             a.path.to_string_lossy() == *src
                         }
                         _ => false,
@@ -169,7 +169,7 @@ impl FcpXml {
                     (item.from * sequence.fps.den as i64) as f64 / sequence.fps.num as f64);
 
                 match &item.kind {
-                    ItemKind::Video { src, frame_rate: _ } => {
+                    ItemKind::Video { src, frame_rate: _, .. } => {
                         let asset_name = Path::new(src).file_stem()
                             .and_then(|s| s.to_str())
                             .unwrap_or("Unknown")
@@ -190,18 +190,18 @@ impl FcpXml {
                         };
                         fcp_assets.push(asset);
 
-                        let clip = FcpClip {
-                            name: asset_name,
-                            uid: clip_uid,
-                            duration: clip_duration,
-                            start: clip_start,
-                            offset: "0s".to_string(),
-                            ref_id: asset_uid,
-                            format: Some("r1".to_string()),
-                            audio_subitems: Vec::new(),
-                        };
-                        clips.push(clip);
-                    }
+                    let clip = FcpClip {
+                        name: asset_name,
+                        uid: clip_uid,
+                        duration: clip_duration,
+                        start: clip_start,
+                        offset: "0s".to_string(),
+                        ref_id: asset_uid,
+                        format: Some("r1".to_string()),
+                        audio_subitems: Vec::new(),
+                    };
+                    clips.push(clip);
+                }
                     ItemKind::Image { src } => {
                         let asset_name = Path::new(src).file_stem()
                             .and_then(|s| s.to_str())
@@ -235,7 +235,7 @@ impl FcpXml {
                         };
                         clips.push(clip);
                     }
-                    ItemKind::Audio { src } => {
+                    ItemKind::Audio { src, .. } => {
                         let asset_name = Path::new(src).file_stem()
                             .and_then(|s| s.to_str())
                             .unwrap_or("Unknown")
@@ -524,10 +524,14 @@ impl FcpXml {
                     ItemKind::Video {
                         src: asset.src.clone(),
                         frame_rate: Some(fps.num as f32 / fps.den as f32),
+                        in_offset_sec: 0.0,
+                        rate: 1.0,
                     }
                 } else if asset.hasAudio {
                     ItemKind::Audio {
                         src: asset.src.clone(),
+                        in_offset_sec: 0.0,
+                        rate: 1.0,
                     }
                 } else {
                     ItemKind::Image {

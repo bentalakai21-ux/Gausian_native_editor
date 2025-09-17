@@ -2,13 +2,34 @@
 #import <AVFoundation/AVFoundation.h>
 #import <CoreMedia/CoreMedia.h>
 #import <VideoToolbox/VideoToolbox.h>
+#import <mach/mach_time.h>
+#import <stdlib.h>
+#import <string.h>
 #import "avfoundation_shim.h"
+
+// Debug logging gate (off by default). Enable with GAUSIAN_DEBUG_IOSURFACE=1
+static BOOL avf_debug_iosurface = NO;
+__attribute__((constructor))
+static void avf_read_env(void) {
+  const char* v = getenv("GAUSIAN_DEBUG_IOSURFACE");
+  avf_debug_iosurface = (v && *v && strcmp(v, "0") != 0);
+}
+#define AVF_LOG_IOS(fmt, ...) do { if (avf_debug_iosurface) NSLog(fmt, ##__VA_ARGS__); } while (0)
+
+// Init-time verbose logging gate (off by default). Enable with GAUSIAN_DEBUG_AVF=1
+static BOOL avf_debug_init = NO;
+__attribute__((constructor))
+static void avf_read_env2(void) {
+  const char* v = getenv("GAUSIAN_DEBUG_AVF");
+  avf_debug_init = (v && *v && strcmp(v, "0") != 0);
+}
+#define AVF_LOG_INIT(fmt, ...) do { if (avf_debug_init) NSLog(fmt, ##__VA_ARGS__); } while (0)
 
 // C interface for AVFoundation operations
 // This shim provides a clean C API that Rust can call
 
 static inline void log_exception(const char* func, NSException* e) {
-  NSLog(@"[shim] EXC in %s: %@ — %@", [NSString stringWithUTF8String:func], e.name, e.reason);
+  NSLog(@"[shim] EXC in %@: %@ — %@", [NSString stringWithUTF8String:func], e.name, e.reason);
 }
 
 static void AVFUncaughtHandler(NSException *e) {
@@ -19,7 +40,7 @@ static void AVFUncaughtHandler(NSException *e) {
 void avf_install_uncaught_exception_handler(void) {
   @autoreleasepool {
     NSSetUncaughtExceptionHandler(&AVFUncaughtHandler);
-    NSLog(@"[shim] Uncaught exception handler installed");
+    AVF_LOG_INIT(@"[shim] Uncaught exception handler installed");
   }
 }
 
@@ -100,8 +121,8 @@ AVFoundationContext* avfoundation_create_context(const char* video_path) {
             ctx->timecode_base = 0.0; // Will be set based on first frame
             ctx->reader_started = 0;
             
-            NSLog(@"Created AVFoundation context: time_scale=%d, fps=%.2f", 
-                  ctx->time_scale, ctx->nominal_fps);
+            AVF_LOG_INIT(@"Created AVFoundation context: time_scale=%d, fps=%.2f", 
+                         ctx->time_scale, ctx->nominal_fps);
             
             return ctx;
         } @catch (NSException* e) {
@@ -307,10 +328,10 @@ void* avfoundation_copy_track_format_desc(AVFoundationContext* ctx) {
             /* Retain before returning across C boundary */
             CFRetain(fmt);
             
-            NSLog(@"Retrieved CMFormatDescriptionRef for track: %dx%d, media type: %s", 
-                  (int)videoTrack.naturalSize.width, 
-                  (int)videoTrack.naturalSize.height,
-                  CMFormatDescriptionGetMediaType(fmt) == kCMMediaType_Video ? "video" : "unknown");
+            AVF_LOG_INIT(@"Retrieved CMFormatDescriptionRef for track: %dx%d, media type: %s", 
+                         (int)videoTrack.naturalSize.width, 
+                         (int)videoTrack.naturalSize.height,
+                         CMFormatDescriptionGetMediaType(fmt) == kCMMediaType_Video ? "video" : "unknown");
             
             return (void*)fmt;
         } @catch (NSException* e) {
@@ -502,9 +523,17 @@ IOSurfaceRef avf_cvpixelbuffer_get_iosurface(void* pixel_buffer) {
       if (surface) {
         // Retain the IOSurface before returning
         CFRetain(surface);
-        NSLog(@"Retrieved IOSurface from CVPixelBuffer: %dx%d", 
-              (int)IOSurfaceGetWidth(surface), 
-              (int)IOSurfaceGetHeight(surface));
+        // Throttle IOSurface logs to at most 1/sec when enabled
+        static uint64_t last_log_ns = 0;
+        uint64_t now = mach_absolute_time();
+        static mach_timebase_info_data_t tb; if (!tb.denom) mach_timebase_info(&tb);
+        uint64_t now_ns = now * tb.numer / tb.denom;
+        if (avf_debug_iosurface && (now_ns - last_log_ns) >= 1000000000ULL) {
+          AVF_LOG_IOS(@"Retrieved IOSurface from CVPixelBuffer: %dx%d",
+                      (int)IOSurfaceGetWidth(surface),
+                      (int)IOSurfaceGetHeight(surface));
+          last_log_ns = now_ns;
+        }
       }
       
       return surface;
@@ -536,29 +565,39 @@ const void* avf_create_iosurface_destination_attributes(int width, int height) {
   }
 }
 
-// IOSurface plane helpers (read-only)
-void avf_iosurface_lock_readonly(IOSurfaceRef s) {
-  if (!s) return;
-  IOSurfaceLock(s, kIOSurfaceLockReadOnly, NULL);
+// --- IOSurface plane helpers (used by wgpu_integration.rs) ---
+void avf_iosurface_lock_readonly(IOSurfaceRef surface) {
+  @autoreleasepool {
+    @try {
+      IOSurfaceLock(surface, kIOSurfaceLockReadOnly, NULL);
+    } @catch (NSException *e) {
+      NSLog(@"[shim] IOSurfaceLock EXC: %@ — %@", e.name, e.reason);
+    }
+  }
 }
 
-void avf_iosurface_unlock(IOSurfaceRef s) {
-  if (!s) return;
-  IOSurfaceUnlock(s, kIOSurfaceLockReadOnly, NULL);
+void avf_iosurface_unlock(IOSurfaceRef surface) {
+  @autoreleasepool {
+    @try {
+      IOSurfaceUnlock(surface, kIOSurfaceLockReadOnly, NULL);
+    } @catch (NSException *e) {
+      NSLog(@"[shim] IOSurfaceUnlock EXC: %@ — %@", e.name, e.reason);
+    }
+  }
 }
 
-size_t avf_iosurface_width_of_plane(IOSurfaceRef s, size_t plane) {
-  return s ? IOSurfaceGetWidthOfPlane(s, plane) : 0;
+size_t avf_iosurface_width_of_plane(IOSurfaceRef surface, size_t plane) {
+  return IOSurfaceGetWidthOfPlane(surface, plane);
 }
 
-size_t avf_iosurface_height_of_plane(IOSurfaceRef s, size_t plane) {
-  return s ? IOSurfaceGetHeightOfPlane(s, plane) : 0;
+size_t avf_iosurface_height_of_plane(IOSurfaceRef surface, size_t plane) {
+  return IOSurfaceGetHeightOfPlane(surface, plane);
 }
 
-size_t avf_iosurface_bytes_per_row_of_plane(IOSurfaceRef s, size_t plane) {
-  return s ? IOSurfaceGetBytesPerRowOfPlane(s, plane) : 0;
+size_t avf_iosurface_bytes_per_row_of_plane(IOSurfaceRef surface, size_t plane) {
+  return IOSurfaceGetBytesPerRowOfPlane(surface, plane);
 }
 
-const void* avf_iosurface_base_address_of_plane(IOSurfaceRef s, size_t plane) {
-  return s ? IOSurfaceGetBaseAddressOfPlane(s, plane) : NULL;
+void* avf_iosurface_base_address_of_plane(IOSurfaceRef surface, size_t plane) {
+  return IOSurfaceGetBaseAddressOfPlane(surface, plane);
 }

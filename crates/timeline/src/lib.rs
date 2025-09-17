@@ -29,14 +29,29 @@ pub enum ItemKind {
     Text { text: String, color: String },
 
     #[serde(rename = "video")]
-    Video { src: String, frame_rate: Option<f32> },
+    Video {
+        src: String,
+        frame_rate: Option<f32>,
+        #[serde(default)]
+        in_offset_sec: f64,
+        #[serde(default = "default_rate")]
+        rate: f32,
+    },
 
     #[serde(rename = "image")]
     Image { src: String },
 
     #[serde(rename = "audio")]
-    Audio { src: String },
+    Audio {
+        src: String,
+        #[serde(default)]
+        in_offset_sec: f64,
+        #[serde(default = "default_rate")]
+        rate: f32,
+    },
 }
+
+fn default_rate() -> f32 { 1.0 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Item {
@@ -70,4 +85,3 @@ impl Sequence {
 
     pub fn add_track(&mut self, track: Track) { self.tracks.push(track); }
 }
-

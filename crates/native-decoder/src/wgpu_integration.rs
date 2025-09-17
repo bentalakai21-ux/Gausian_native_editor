@@ -11,6 +11,8 @@ use std::sync::Arc;
 #[cfg(target_os = "macos")]
 use wgpu::*;
 #[cfg(target_os = "macos")]
+use std::num::NonZeroU32;
+#[cfg(target_os = "macos")]
 use std::slice;
 #[cfg(target_os = "macos")]
 use core_foundation::base::TCFType;
@@ -29,7 +31,7 @@ extern "C" {
 #[inline]
 fn align_up(x: u32, align: u32) -> u32 { (x + align - 1) & !(align - 1) }
 #[cfg(target_os = "macos")]
-use tracing::info;
+use tracing::{debug, info};
 
 /// WGPU external texture for IOSurface integration
 #[cfg(target_os = "macos")]
@@ -46,7 +48,7 @@ impl IOSurfaceTexture {
     /// Create a WGPU texture from an IOSurface frame
     pub fn from_iosurface_frame(
         device: &Device,
-        queue: &Queue,
+        _queue: &Queue,
         frame: &IOSurfaceFrame,
     ) -> Result<Self> {
         // Create external texture descriptor
@@ -83,7 +85,7 @@ impl IOSurfaceTexture {
     }
 
     /// Update texture with new IOSurface data
-    pub fn update_from_iosurface(&self, queue: &Queue, frame: &IOSurfaceFrame) -> Result<()> {
+    pub fn update_from_iosurface(&self, _queue: &Queue, _frame: &IOSurfaceFrame) -> Result<()> {
         // In a real implementation, we would:
         // 1. Lock the IOSurface
         // 2. Copy data directly to GPU memory
@@ -136,50 +138,53 @@ impl GpuYuv {
         let src_bpr1 = unsafe { avf_iosurface_bytes_per_row_of_plane(s_ref, 1) } as u32;
         let base1 = unsafe { avf_iosurface_base_address_of_plane(s_ref, 1) } as *const u8;
 
-        info!("IOSurface planes: Y {}x{} bpr={} | UV {}x{} bpr={}", w0, h0, src_bpr0, w1, h1, src_bpr1);
+        debug!("IOSurface planes: Y {}x{} bpr={} | UV {}x{} bpr={}", w0, h0, src_bpr0, w1, h1, src_bpr1);
 
         // Convert base addresses to slices
         let y_src = unsafe { slice::from_raw_parts(base0, (src_bpr0 * h0) as usize) };
         let uv_src = unsafe { slice::from_raw_parts(base1, (src_bpr1 * h1) as usize) };
 
-        // Repack rows to 256-byte multiples as required by wgpu bytes_per_row
+        // Try direct upload using IOSurface BPR; fall back to repack if alignment is invalid.
         const ALIGN: u32 = 256;
 
-        // Y is 1 byte per pixel
-        let dst_bpr0 = align_up(w0, ALIGN);
-        let mut y_packed = vec![0u8; (dst_bpr0 * h0) as usize];
-        for row in 0..h0 {
-            let src_off = row * src_bpr0;
-            let dst_off = row * dst_bpr0;
-            y_packed[dst_off as usize .. (dst_off + w0) as usize]
-                .copy_from_slice(&y_src[src_off as usize .. (src_off + w0) as usize]);
-        }
+        let (y_owned, y_bpr_use) = if src_bpr0 % ALIGN == 0 {
+            (None, src_bpr0)
+        } else {
+            let dst_bpr0 = ((w0 + ALIGN - 1) / ALIGN) * ALIGN;
+            let mut packed = vec![0u8; (dst_bpr0 * h0) as usize];
+            for row in 0..h0 {
+                let src_off = (row * src_bpr0) as usize;
+                let dst_off = (row * dst_bpr0) as usize;
+                packed[dst_off .. dst_off + (w0 as usize)].copy_from_slice(&y_src[src_off .. src_off + (w0 as usize)]);
+            }
+            debug!("NV12 Y repack due to alignment: {} -> {}", src_bpr0, dst_bpr0);
+            (Some(packed), dst_bpr0)
+        };
+        let y_bytes: &[u8] = y_owned.as_deref().unwrap_or(y_src);
 
-        // UV is 2 bytes per pixel (Rg8), size w1 x h1
         let row_bytes_uv = w1 * 2;
-        let dst_bpr1 = align_up(row_bytes_uv, ALIGN);
-        let mut uv_packed = vec![0u8; (dst_bpr1 * h1) as usize];
-        for row in 0..h1 {
-            let src_off = row * src_bpr1;
-            let dst_off = row * dst_bpr1;
-            uv_packed[dst_off as usize .. (dst_off + row_bytes_uv) as usize]
-                .copy_from_slice(&uv_src[src_off as usize .. (src_off + row_bytes_uv) as usize]);
-        }
-
-        info!("NV12 repack: Y dst_bpr={} UV dst_bpr={}", dst_bpr0, dst_bpr1);
+        let (uv_owned, uv_bpr_use) = if src_bpr1 % ALIGN == 0 && src_bpr1 >= row_bytes_uv {
+            (None, src_bpr1)
+        } else {
+            let dst_bpr1 = ((row_bytes_uv + ALIGN - 1) / ALIGN) * ALIGN;
+            let mut packed = vec![0u8; (dst_bpr1 * h1) as usize];
+            for row in 0..h1 {
+                let src_off = (row * src_bpr1) as usize;
+                let dst_off = (row * dst_bpr1) as usize;
+                packed[dst_off .. dst_off + (row_bytes_uv as usize)].copy_from_slice(&uv_src[src_off .. src_off + (row_bytes_uv as usize)]);
+            }
+            debug!("NV12 UV repack due to alignment: {} -> {}", src_bpr1, dst_bpr1);
+            (Some(packed), dst_bpr1)
+        };
+        let uv_bytes: &[u8] = uv_owned.as_deref().unwrap_or(uv_src);
 
         // Upload Y
         queue.write_texture(
-            ImageCopyTexture {
-                texture: &self.y_tex,
-                mip_level: 0,
-                origin: Origin3d::ZERO,
-                aspect: TextureAspect::All,
-            },
-            &y_packed,
+            ImageCopyTexture { texture: &self.y_tex, mip_level: 0, origin: Origin3d::ZERO, aspect: TextureAspect::All },
+            y_bytes,
             ImageDataLayout {
                 offset: 0,
-                bytes_per_row: Some(dst_bpr0),
+                bytes_per_row: Some(y_bpr_use),
                 rows_per_image: Some(h0),
             },
             Extent3d { width: w0, height: h0, depth_or_array_layers: 1 },
@@ -187,22 +192,17 @@ impl GpuYuv {
 
         // Upload UV
         queue.write_texture(
-            ImageCopyTexture {
-                texture: &self.uv_tex,
-                mip_level: 0,
-                origin: Origin3d::ZERO,
-                aspect: TextureAspect::All,
-            },
-            &uv_packed,
+            ImageCopyTexture { texture: &self.uv_tex, mip_level: 0, origin: Origin3d::ZERO, aspect: TextureAspect::All },
+            uv_bytes,
             ImageDataLayout {
                 offset: 0,
-                bytes_per_row: Some(dst_bpr1),
+                bytes_per_row: Some(uv_bpr_use),
                 rows_per_image: Some(h1),
             },
             Extent3d { width: w1, height: h1, depth_or_array_layers: 1 },
         );
 
-        info!("NV12 wrote bytes: Y={} UV={}", y_packed.len(), uv_packed.len());
+        debug!("NV12 wrote bytes: Y={} UV={}", (y_bpr_use as usize) * (h0 as usize), (uv_bpr_use as usize) * (h1 as usize));
 
         unsafe { avf_iosurface_unlock(s_ref) };
         Ok(())
@@ -302,6 +302,7 @@ impl IOSurfaceRenderPipeline {
                 alpha_to_coverage_enabled: false,
             },
             multiview: None,
+            cache: None,
         });
 
         Ok(Self {

@@ -1,6 +1,7 @@
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex, atomic::{AtomicBool, Ordering}};
 use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant};
 use cpal::traits::{HostTrait, DeviceTrait, StreamTrait};
 
 pub struct AudioState {
@@ -11,11 +12,13 @@ pub struct AudioState {
     worker: Option<JoinHandle<()>>,
     stop: Option<Arc<AtomicBool>>,
     current: Option<String>,
+    current_t: Option<f64>,
+    last_seek_at: Option<Instant>,
 }
 
 impl AudioState {
     pub fn new() -> Self {
-        Self { device_sr: None, channels: 2, stream: None, samples: Arc::new(Mutex::new(VecDeque::with_capacity(48000*4))), worker: None, stop: None, current: None }
+        Self { device_sr: None, channels: 2, stream: None, samples: Arc::new(Mutex::new(VecDeque::with_capacity(48000*4))), worker: None, stop: None, current: None, current_t: None, last_seek_at: None }
     }
 
     pub fn ensure_playing(&mut self, src_path: Option<&str>, t_sec: f64) {
@@ -26,6 +29,36 @@ impl AudioState {
             self.start_output_stream();
             self.start_ffmpeg_reader(path, t_sec);
             self.current = Some(path.to_string());
+            self.current_t = Some(t_sec);
+            self.last_seek_at = Some(Instant::now());
+        }
+    }
+
+    /// Preview audio while scrubbing when paused.
+    /// Re-seeks at a throttled interval to avoid spawning too often.
+    pub fn preview_scrub(&mut self, src_path: Option<&str>, t_sec: f64) {
+        if src_path.is_none() { self.stop(); return; }
+        let path = src_path.unwrap();
+        if self.stream.is_none() {
+            self.start_output_stream();
+        }
+        // Decide whether to (re)start the reader
+        let path_changed = self.current.as_deref() != Some(path);
+        let need_seek = match self.current_t {
+            Some(ct) => (ct - t_sec).abs() > 0.08,
+            None => true,
+        };
+        let throttled = match self.last_seek_at {
+            Some(t) => t.elapsed() >= Duration::from_millis(80),
+            None => true,
+        };
+        if path_changed || (need_seek && throttled) || self.worker.is_none() {
+            // Restart just the reader thread; keep the output stream
+            self.stop_reader_only();
+            self.start_ffmpeg_reader(path, t_sec);
+            self.current = Some(path.to_string());
+            self.current_t = Some(t_sec);
+            self.last_seek_at = Some(Instant::now());
         }
     }
 
@@ -97,6 +130,14 @@ impl AudioState {
         if let Some(h) = self.worker.take() { let _ = h.join(); }
         self.stop = None;
         self.current = None;
+        self.current_t = None;
+        self.last_seek_at = None;
+    }
+
+    fn stop_reader_only(&mut self) {
+        if let Some(s) = &self.stop { s.store(true, Ordering::Relaxed); }
+        if let Some(h) = self.worker.take() { let _ = h.join(); }
+        self.stop = None;
     }
 }
 

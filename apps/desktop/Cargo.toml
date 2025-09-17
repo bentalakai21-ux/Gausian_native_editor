@@ -13,9 +13,10 @@ egui_extras = { version = "0.29", features = ["default"] }
 rfd = "0.15"
 uuid = { version = "1", features = ["v4"] }
 image = "0.25"
-cpal = "0.15"
 crossbeam-channel = "0.5"
+crossbeam = "0.8"
 wgpu = "0.20"
+bytemuck = { version = "1", features = ["derive"] }
 project = { path = "../../crates/project" }
 timeline = { path = "../../crates/timeline" }
 renderer = { path = "../../crates/renderer" }
@@ -27,6 +28,21 @@ media-io = { path = "../../crates/media-io" }
 pathdiff = "0.2"
 jobs = { path = "../../crates/jobs" }
 native-decoder = { path = "../../crates/native-decoder" }
+tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
+tracing = "0.1"
 
 [features]
 unsafe-interop = []
+
+# If you use cpal or rodio, make them mac-first via target sections.
+# It's OK if only one of these appears in your repo; keep both sections—Cargo ignores unused ones.
+
+[target.'cfg(target_os = "macos")'.dependencies]
+# Use CoreAudio on macOS (cpal selects correct backend automatically)
+cpal = { version = "0.15" }
+rodio = { version = "0.17" }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# Keep ALSA available on Linux (cpal selects correct backend automatically)
+cpal = { version = "0.15" }
+rodio = { version = "0.17" }
