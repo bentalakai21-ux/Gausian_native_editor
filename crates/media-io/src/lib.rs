@@ -1,10 +1,10 @@
 use serde::Deserialize;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use thiserror::Error;
-use std::collections::HashMap;
 mod yuv_decode;
-pub use yuv_decode::{YuvPixFmt, YuvFrame, VideoDecoder, best_decoder, decode_yuv_at};
+pub use yuv_decode::{best_decoder, decode_yuv_at, VideoDecoder, YuvFrame, YuvPixFmt};
 
 #[derive(Debug, Error)]
 pub enum ProbeError {
@@ -53,15 +53,23 @@ pub struct MediaInfo {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum MediaKind { Video, Image, Audio }
+pub enum MediaKind {
+    Video,
+    Image,
+    Audio,
+}
 
 fn parse_rate(s: &str) -> Option<(u32, u32)> {
     let s = s.trim();
-    if s == "0/0" || s == "0" || s.is_empty() { return None; }
-    if let Some((a,b)) = s.split_once('/') {
+    if s == "0/0" || s == "0" || s.is_empty() {
+        return None;
+    }
+    if let Some((a, b)) = s.split_once('/') {
         let num = a.parse().ok()?;
         let den = b.parse().ok()?;
-        if den == 0 { return None; }
+        if den == 0 {
+            return None;
+        }
         return Some((num, den));
     }
     // integer fallback
@@ -73,18 +81,22 @@ pub fn probe_media(path: &Path) -> Result<MediaInfo, ProbeError> {
     let ffprobe = which::which("ffprobe").map_err(|_| ProbeError::FfprobeMissing)?;
     let path_str = path.to_string_lossy().to_string();
     let out = Command::new(ffprobe)
-        .arg("-v").arg("error")
+        .arg("-v")
+        .arg("error")
         .arg("-show_format")
         .arg("-show_streams")
-        .arg("-print_format").arg("json")
+        .arg("-print_format")
+        .arg("json")
         .arg(path_str)
         .output()
         .map_err(|e| ProbeError::FfprobeFailed(e.to_string()))?;
     if !out.status.success() {
-        return Err(ProbeError::FfprobeFailed(String::from_utf8_lossy(&out.stderr).into()));
+        return Err(ProbeError::FfprobeFailed(
+            String::from_utf8_lossy(&out.stderr).into(),
+        ));
     }
-    let parsed: FfprobeJson = serde_json::from_slice(&out.stdout)
-        .map_err(|e| ProbeError::Parse(e.to_string()))?;
+    let parsed: FfprobeJson =
+        serde_json::from_slice(&out.stdout).map_err(|e| ProbeError::Parse(e.to_string()))?;
 
     let mut kind = MediaKind::Video;
     let mut width = None;
@@ -100,16 +112,22 @@ pub fn probe_media(path: &Path) -> Result<MediaInfo, ProbeError> {
                     kind = MediaKind::Video;
                     width = width.or(s.width);
                     height = height.or(s.height);
-                    fps = fps.or_else(|| s.avg_frame_rate.as_deref().and_then(parse_rate))
-                             .or_else(|| s.r_frame_rate.as_deref().and_then(parse_rate));
+                    fps = fps
+                        .or_else(|| s.avg_frame_rate.as_deref().and_then(parse_rate))
+                        .or_else(|| s.r_frame_rate.as_deref().and_then(parse_rate));
                 }
                 Some("audio") => {
-                    if kind != MediaKind::Video { kind = MediaKind::Audio; }
+                    if kind != MediaKind::Video {
+                        kind = MediaKind::Audio;
+                    }
                     audio_channels = audio_channels.or(s.channels);
-                    sample_rate = sample_rate.or(s.sample_rate.as_deref().and_then(|x| x.parse().ok()));
+                    sample_rate =
+                        sample_rate.or(s.sample_rate.as_deref().and_then(|x| x.parse().ok()));
                 }
                 Some("image") => {
-                    if kind != MediaKind::Video { kind = MediaKind::Image; }
+                    if kind != MediaKind::Video {
+                        kind = MediaKind::Image;
+                    }
                     width = width.or(s.width);
                     height = height.or(s.height);
                 }
@@ -124,7 +142,7 @@ pub fn probe_media(path: &Path) -> Result<MediaInfo, ProbeError> {
         .and_then(|f| f.duration.as_deref())
         .and_then(|d| d.parse().ok());
 
-    let (fps_num, fps_den) = fps.map(|(n,d)| (Some(n), Some(d))).unwrap_or((None, None));
+    let (fps_num, fps_den) = fps.map(|(n, d)| (Some(n), Some(d))).unwrap_or((None, None));
 
     Ok(MediaInfo {
         path: path.to_path_buf(),
@@ -148,24 +166,33 @@ pub fn generate_proxy(
     bitrate_kbps: u32,
 ) -> Result<(), ProbeError> {
     let ffmpeg = which::which("ffmpeg").map_err(|_| ProbeError::FfprobeMissing)?;
-    
+
     let output = Command::new(ffmpeg)
-        .arg("-i").arg(input_path)
-        .arg("-vf").arg(format!("scale={}:{}", width, height))
-        .arg("-c:v").arg("libx264")
-        .arg("-b:v").arg(format!("{}k", bitrate_kbps))
-        .arg("-c:a").arg("aac")
-        .arg("-b:a").arg("128k")
-        .arg("-preset").arg("fast")
+        .arg("-i")
+        .arg(input_path)
+        .arg("-vf")
+        .arg(format!("scale={}:{}", width, height))
+        .arg("-c:v")
+        .arg("libx264")
+        .arg("-b:v")
+        .arg(format!("{}k", bitrate_kbps))
+        .arg("-c:a")
+        .arg("aac")
+        .arg("-b:a")
+        .arg("128k")
+        .arg("-preset")
+        .arg("fast")
         .arg("-y") // Overwrite output
         .arg(output_path)
         .output()
         .map_err(|e| ProbeError::FfprobeFailed(e.to_string()))?;
-    
+
     if !output.status.success() {
-        return Err(ProbeError::FfprobeFailed(String::from_utf8_lossy(&output.stderr).into()));
+        return Err(ProbeError::FfprobeFailed(
+            String::from_utf8_lossy(&output.stderr).into(),
+        ));
     }
-    
+
     Ok(())
 }
 
@@ -178,64 +205,78 @@ pub fn generate_thumbnail(
     height: u32,
 ) -> Result<(), ProbeError> {
     let ffmpeg = which::which("ffmpeg").map_err(|_| ProbeError::FfprobeMissing)?;
-    
+
     let output = Command::new(ffmpeg)
-        .arg("-ss").arg(format!("{:.3}", time_seconds))
-        .arg("-i").arg(input_path)
-        .arg("-vframes").arg("1")
-        .arg("-vf").arg(format!("scale={}:{}", width, height))
+        .arg("-ss")
+        .arg(format!("{:.3}", time_seconds))
+        .arg("-i")
+        .arg(input_path)
+        .arg("-vframes")
+        .arg("1")
+        .arg("-vf")
+        .arg(format!("scale={}:{}", width, height))
         .arg("-y") // Overwrite output
         .arg(output_path)
         .output()
         .map_err(|e| ProbeError::FfprobeFailed(e.to_string()))?;
-    
+
     if !output.status.success() {
-        return Err(ProbeError::FfprobeFailed(String::from_utf8_lossy(&output.stderr).into()));
+        return Err(ProbeError::FfprobeFailed(
+            String::from_utf8_lossy(&output.stderr).into(),
+        ));
     }
-    
+
     Ok(())
 }
 
 /// Generate audio waveform data
 pub fn generate_waveform(input_path: &Path, samples: u32) -> Result<Vec<f32>, ProbeError> {
     let ffmpeg = which::which("ffmpeg").map_err(|_| ProbeError::FfprobeMissing)?;
-    
+
     let output = Command::new(ffmpeg)
-        .arg("-i").arg(input_path)
-        .arg("-ac").arg("1") // Mono
-        .arg("-ar").arg("8000") // 8kHz sample rate
-        .arg("-f").arg("f32le") // 32-bit float little-endian
+        .arg("-i")
+        .arg(input_path)
+        .arg("-ac")
+        .arg("1") // Mono
+        .arg("-ar")
+        .arg("8000") // 8kHz sample rate
+        .arg("-f")
+        .arg("f32le") // 32-bit float little-endian
         .arg("-")
         .output()
         .map_err(|e| ProbeError::FfprobeFailed(e.to_string()))?;
-    
+
     if !output.status.success() {
-        return Err(ProbeError::FfprobeFailed(String::from_utf8_lossy(&output.stderr).into()));
+        return Err(ProbeError::FfprobeFailed(
+            String::from_utf8_lossy(&output.stderr).into(),
+        ));
     }
-    
+
     // Convert raw audio data to waveform samples
     let audio_data = output.stdout;
     let mut waveform = Vec::new();
     let chunk_size = (audio_data.len() / 4) / samples as usize; // 4 bytes per f32
-    
+
     for chunk_start in (0..audio_data.len()).step_by(chunk_size * 4) {
         let chunk_end = (chunk_start + chunk_size * 4).min(audio_data.len());
         let chunk = &audio_data[chunk_start..chunk_end];
-        
+
         let mut max_amplitude = 0.0f32;
         for sample_bytes in chunk.chunks_exact(4) {
             if sample_bytes.len() == 4 {
                 let sample = f32::from_le_bytes([
-                    sample_bytes[0], sample_bytes[1], 
-                    sample_bytes[2], sample_bytes[3]
+                    sample_bytes[0],
+                    sample_bytes[1],
+                    sample_bytes[2],
+                    sample_bytes[3],
                 ]);
                 max_amplitude = max_amplitude.max(sample.abs());
             }
         }
-        
+
         waveform.push(max_amplitude);
     }
-    
+
     Ok(waveform)
 }
 
@@ -267,7 +308,7 @@ impl ExportPreset {
             additional_args: vec!["-preset".to_string(), "medium".to_string()],
         }
     }
-    
+
     pub fn h264_720p() -> Self {
         Self {
             name: "H.264 720p".to_string(),
@@ -281,7 +322,7 @@ impl ExportPreset {
             additional_args: vec!["-preset".to_string(), "medium".to_string()],
         }
     }
-    
+
     pub fn av1_1080p() -> Self {
         Self {
             name: "AV1 1080p".to_string(),
@@ -304,65 +345,68 @@ pub fn export_video(
     preset: &ExportPreset,
 ) -> Result<(), ProbeError> {
     let ffmpeg = which::which("ffmpeg").map_err(|_| ProbeError::FfprobeMissing)?;
-    
+
     let mut cmd = Command::new(ffmpeg);
     cmd.arg("-i").arg(input_path);
-    
+
     // Video codec
     cmd.arg("-c:v").arg(&preset.codec);
-    
+
     // Video bitrate
     if let Some(bitrate) = preset.video_bitrate {
         cmd.arg("-b:v").arg(format!("{}k", bitrate));
     }
-    
+
     // Resolution
     if let (Some(width), Some(height)) = (preset.width, preset.height) {
         cmd.arg("-vf").arg(format!("scale={}:{}", width, height));
     }
-    
+
     // Frame rate
     if let Some((num, den)) = preset.fps {
         cmd.arg("-r").arg(format!("{}/{}", num, den));
     }
-    
+
     // Audio codec and bitrate
     cmd.arg("-c:a").arg("aac");
     if let Some(audio_bitrate) = preset.audio_bitrate {
         cmd.arg("-b:a").arg(format!("{}k", audio_bitrate));
     }
-    
+
     // Additional arguments
     for arg in &preset.additional_args {
         cmd.arg(arg);
     }
-    
+
     // Output
     cmd.arg("-y").arg(output_path);
-    
-    let output = cmd.output()
+
+    let output = cmd
+        .output()
         .map_err(|e| ProbeError::FfprobeFailed(e.to_string()))?;
-    
+
     if !output.status.success() {
-        return Err(ProbeError::FfprobeFailed(String::from_utf8_lossy(&output.stderr).into()));
+        return Err(ProbeError::FfprobeFailed(
+            String::from_utf8_lossy(&output.stderr).into(),
+        ));
     }
-    
+
     Ok(())
 }
 
 /// Get available hardware encoders on the system
 pub fn get_hardware_encoders() -> HashMap<String, Vec<String>> {
     let mut encoders = HashMap::new();
-    
+
     if let Ok(ffmpeg) = which::which("ffmpeg") {
         if let Ok(output) = Command::new(ffmpeg).arg("-encoders").output() {
             let output_str = String::from_utf8_lossy(&output.stdout);
-            
+
             // Parse available hardware encoders
             let mut h264_encoders = Vec::new();
             let mut hevc_encoders = Vec::new();
             let mut av1_encoders = Vec::new();
-            
+
             for line in output_str.lines() {
                 if line.contains("h264") {
                     if line.contains("videotoolbox") {
@@ -378,7 +422,7 @@ pub fn get_hardware_encoders() -> HashMap<String, Vec<String>> {
                         h264_encoders.push("h264_vaapi".to_string());
                     }
                 }
-                
+
                 if line.contains("hevc") || line.contains("h265") {
                     if line.contains("videotoolbox") {
                         hevc_encoders.push("hevc_videotoolbox".to_string());
@@ -393,7 +437,7 @@ pub fn get_hardware_encoders() -> HashMap<String, Vec<String>> {
                         hevc_encoders.push("hevc_vaapi".to_string());
                     }
                 }
-                
+
                 if line.contains("av1") {
                     if line.contains("nvenc") {
                         av1_encoders.push("av1_nvenc".to_string());
@@ -406,7 +450,7 @@ pub fn get_hardware_encoders() -> HashMap<String, Vec<String>> {
                     }
                 }
             }
-            
+
             if !h264_encoders.is_empty() {
                 encoders.insert("H.264".to_string(), h264_encoders);
             }
@@ -418,6 +462,6 @@ pub fn get_hardware_encoders() -> HashMap<String, Vec<String>> {
             }
         }
     }
-    
+
     encoders
 }

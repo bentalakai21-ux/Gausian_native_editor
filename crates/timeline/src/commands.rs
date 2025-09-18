@@ -2,8 +2,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::{
-    AutomationKeyframe, AutomationLane, FrameRange, Frame, LaneId, NodeId, TimelineEdge, TimelineError,
-    TimelineGraph, TimelineNode, TimelineNodeKind, TrackBinding, TrackId, TrackKind,
+    AutomationKeyframe, AutomationLane, Frame, FrameRange, LaneId, NodeId, TimelineEdge,
+    TimelineError, TimelineGraph, TimelineNode, TimelineNodeKind, TrackBinding, TrackId, TrackKind,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
@@ -59,9 +59,16 @@ pub enum TimelineCommand {
     },
 }
 
-pub fn apply_command(graph: &mut TimelineGraph, command: TimelineCommand) -> Result<TimelineCommand, TimelineError> {
+pub fn apply_command(
+    graph: &mut TimelineGraph,
+    command: TimelineCommand,
+) -> Result<TimelineCommand, TimelineError> {
     match command {
-        TimelineCommand::InsertNode { node, placements, edges } => insert_node(graph, node, placements, edges),
+        TimelineCommand::InsertNode {
+            node,
+            placements,
+            edges,
+        } => insert_node(graph, node, placements, edges),
         TimelineCommand::RemoveNode { node_id } => remove_node(graph, node_id),
         TimelineCommand::UpdateNode { node } => update_node(graph, node),
         TimelineCommand::AddEdge { edge } => add_edge(graph, edge),
@@ -71,10 +78,12 @@ pub fn apply_command(graph: &mut TimelineGraph, command: TimelineCommand) -> Res
         TimelineCommand::AddAutomationLane { lane } => add_lane(graph, lane),
         TimelineCommand::UpdateAutomationLane { lane } => update_lane(graph, lane),
         TimelineCommand::RemoveAutomationLane { lane_id } => remove_lane(graph, lane_id),
-        TimelineCommand::InsertAutomationKeyframe { lane_id, keyframe } =>
-            insert_keyframe(graph, lane_id, keyframe),
-        TimelineCommand::RemoveAutomationKeyframe { lane_id, frame } =>
-            remove_keyframe(graph, lane_id, frame),
+        TimelineCommand::InsertAutomationKeyframe { lane_id, keyframe } => {
+            insert_keyframe(graph, lane_id, keyframe)
+        }
+        TimelineCommand::RemoveAutomationKeyframe { lane_id, frame } => {
+            remove_keyframe(graph, lane_id, frame)
+        }
     }
 }
 
@@ -107,8 +116,14 @@ fn insert_node(
     Ok(TimelineCommand::RemoveNode { node_id: node.id })
 }
 
-fn remove_node(graph: &mut TimelineGraph, node_id: NodeId) -> Result<TimelineCommand, TimelineError> {
-    let node = graph.nodes.remove(&node_id).ok_or(TimelineError::NodeNotFound(node_id))?;
+fn remove_node(
+    graph: &mut TimelineGraph,
+    node_id: NodeId,
+) -> Result<TimelineCommand, TimelineError> {
+    let node = graph
+        .nodes
+        .remove(&node_id)
+        .ok_or(TimelineError::NodeNotFound(node_id))?;
 
     let mut placements = Vec::new();
     for track in graph.tracks.iter_mut() {
@@ -116,7 +131,10 @@ fn remove_node(graph: &mut TimelineGraph, node_id: NodeId) -> Result<TimelineCom
         while i < track.node_ids.len() {
             if track.node_ids[i] == node_id {
                 track.node_ids.remove(i);
-                placements.push(TrackPlacement { track_id: track.id, position: Some(i) });
+                placements.push(TrackPlacement {
+                    track_id: track.id,
+                    position: Some(i),
+                });
             } else {
                 i += 1;
             }
@@ -134,10 +152,17 @@ fn remove_node(graph: &mut TimelineGraph, node_id: NodeId) -> Result<TimelineCom
         }
     }
 
-    Ok(TimelineCommand::InsertNode { node, placements, edges })
+    Ok(TimelineCommand::InsertNode {
+        node,
+        placements,
+        edges,
+    })
 }
 
-fn update_node(graph: &mut TimelineGraph, node: TimelineNode) -> Result<TimelineCommand, TimelineError> {
+fn update_node(
+    graph: &mut TimelineGraph,
+    node: TimelineNode,
+) -> Result<TimelineCommand, TimelineError> {
     let node_id = node.id;
     if let Some(entry) = graph.nodes.get_mut(&node_id) {
         let previous = entry.clone();
@@ -148,21 +173,31 @@ fn update_node(graph: &mut TimelineGraph, node: TimelineNode) -> Result<Timeline
     }
 }
 
-fn add_edge(graph: &mut TimelineGraph, edge: TimelineEdge) -> Result<TimelineCommand, TimelineError> {
+fn add_edge(
+    graph: &mut TimelineGraph,
+    edge: TimelineEdge,
+) -> Result<TimelineCommand, TimelineError> {
     if !graph.nodes.contains_key(&edge.from) {
         return Err(TimelineError::NodeNotFound(edge.from));
     }
     if !graph.nodes.contains_key(&edge.to) {
         return Err(TimelineError::NodeNotFound(edge.to));
     }
-    if graph.edges.iter().any(|e| e.from == edge.from && e.to == edge.to && e.kind == edge.kind) {
+    if graph
+        .edges
+        .iter()
+        .any(|e| e.from == edge.from && e.to == edge.to && e.kind == edge.kind)
+    {
         return Err(TimelineError::EdgeExists(edge.from, edge.to));
     }
     graph.edges.push(edge.clone());
     Ok(TimelineCommand::RemoveEdge { edge })
 }
 
-fn remove_edge(graph: &mut TimelineGraph, edge: TimelineEdge) -> Result<TimelineCommand, TimelineError> {
+fn remove_edge(
+    graph: &mut TimelineGraph,
+    edge: TimelineEdge,
+) -> Result<TimelineCommand, TimelineError> {
     if let Some(idx) = graph
         .edges
         .iter()
@@ -175,7 +210,10 @@ fn remove_edge(graph: &mut TimelineGraph, edge: TimelineEdge) -> Result<Timeline
     }
 }
 
-fn upsert_track(graph: &mut TimelineGraph, track: TrackBinding) -> Result<TimelineCommand, TimelineError> {
+fn upsert_track(
+    graph: &mut TimelineGraph,
+    track: TrackBinding,
+) -> Result<TimelineCommand, TimelineError> {
     if let Some(idx) = graph.tracks.iter().position(|t| t.id == track.id) {
         let previous = std::mem::replace(&mut graph.tracks[idx], track);
         Ok(TimelineCommand::UpsertTrack { track: previous })
@@ -185,7 +223,10 @@ fn upsert_track(graph: &mut TimelineGraph, track: TrackBinding) -> Result<Timeli
     }
 }
 
-fn remove_track(graph: &mut TimelineGraph, track_id: TrackId) -> Result<TimelineCommand, TimelineError> {
+fn remove_track(
+    graph: &mut TimelineGraph,
+    track_id: TrackId,
+) -> Result<TimelineCommand, TimelineError> {
     if let Some(idx) = graph.tracks.iter().position(|t| t.id == track_id) {
         let track = graph.tracks.remove(idx);
         Ok(TimelineCommand::UpsertTrack { track })
@@ -194,15 +235,24 @@ fn remove_track(graph: &mut TimelineGraph, track_id: TrackId) -> Result<Timeline
     }
 }
 
-fn add_lane(graph: &mut TimelineGraph, lane: AutomationLane) -> Result<TimelineCommand, TimelineError> {
+fn add_lane(
+    graph: &mut TimelineGraph,
+    lane: AutomationLane,
+) -> Result<TimelineCommand, TimelineError> {
     if graph.automation.iter().any(|l| l.id == lane.id) {
-        return Err(TimelineError::InvalidOp(format!("automation lane exists: {}", lane.id)));
+        return Err(TimelineError::InvalidOp(format!(
+            "automation lane exists: {}",
+            lane.id
+        )));
     }
     graph.automation.push(lane.clone());
     Ok(TimelineCommand::RemoveAutomationLane { lane_id: lane.id })
 }
 
-fn update_lane(graph: &mut TimelineGraph, lane: AutomationLane) -> Result<TimelineCommand, TimelineError> {
+fn update_lane(
+    graph: &mut TimelineGraph,
+    lane: AutomationLane,
+) -> Result<TimelineCommand, TimelineError> {
     if let Some(idx) = graph.automation.iter().position(|l| l.id == lane.id) {
         let previous = std::mem::replace(&mut graph.automation[idx], lane);
         Ok(TimelineCommand::UpdateAutomationLane { lane: previous })
@@ -211,7 +261,10 @@ fn update_lane(graph: &mut TimelineGraph, lane: AutomationLane) -> Result<Timeli
     }
 }
 
-fn remove_lane(graph: &mut TimelineGraph, lane_id: LaneId) -> Result<TimelineCommand, TimelineError> {
+fn remove_lane(
+    graph: &mut TimelineGraph,
+    lane_id: LaneId,
+) -> Result<TimelineCommand, TimelineError> {
     if let Some(idx) = graph.automation.iter().position(|l| l.id == lane_id) {
         let lane = graph.automation.remove(idx);
         Ok(TimelineCommand::AddAutomationLane { lane })
@@ -232,16 +285,29 @@ fn insert_keyframe(
         .ok_or(TimelineError::LaneNotFound(lane_id))?;
 
     let mut previous: Option<AutomationKeyframe> = None;
-    if let Some(idx) = lane.keyframes.iter().position(|k| k.frame == keyframe.frame) {
-        previous = Some(std::mem::replace(&mut lane.keyframes[idx], keyframe.clone()));
+    if let Some(idx) = lane
+        .keyframes
+        .iter()
+        .position(|k| k.frame == keyframe.frame)
+    {
+        previous = Some(std::mem::replace(
+            &mut lane.keyframes[idx],
+            keyframe.clone(),
+        ));
     } else {
         lane.keyframes.push(keyframe.clone());
         lane.keyframes.sort_by_key(|k| k.frame);
     }
 
     let inverse = match previous {
-        Some(old) => TimelineCommand::InsertAutomationKeyframe { lane_id, keyframe: old },
-        None => TimelineCommand::RemoveAutomationKeyframe { lane_id, frame: keyframe.frame },
+        Some(old) => TimelineCommand::InsertAutomationKeyframe {
+            lane_id,
+            keyframe: old,
+        },
+        None => TimelineCommand::RemoveAutomationKeyframe {
+            lane_id,
+            frame: keyframe.frame,
+        },
     };
     Ok(inverse)
 }
@@ -259,13 +325,22 @@ fn remove_keyframe(
 
     if let Some(idx) = lane.keyframes.iter().position(|k| k.frame == frame) {
         let removed = lane.keyframes.remove(idx);
-        Ok(TimelineCommand::InsertAutomationKeyframe { lane_id, keyframe: removed })
+        Ok(TimelineCommand::InsertAutomationKeyframe {
+            lane_id,
+            keyframe: removed,
+        })
     } else {
-        Err(TimelineError::InvalidOp(format!("keyframe not found at frame {}", frame)))
+        Err(TimelineError::InvalidOp(format!(
+            "keyframe not found at frame {}",
+            frame
+        )))
     }
 }
 
-fn validate_placements(graph: &TimelineGraph, placements: &[TrackPlacement]) -> Result<(), TimelineError> {
+fn validate_placements(
+    graph: &TimelineGraph,
+    placements: &[TrackPlacement],
+) -> Result<(), TimelineError> {
     for placement in placements {
         let track = graph
             .tracks
@@ -296,7 +371,11 @@ fn validate_edges_for_insert(
         if edge.to != new_node && !graph.nodes.contains_key(&edge.to) {
             return Err(TimelineError::NodeNotFound(edge.to));
         }
-        if graph.edges.iter().any(|e| e.from == edge.from && e.to == edge.to && e.kind == edge.kind) {
+        if graph
+            .edges
+            .iter()
+            .any(|e| e.from == edge.from && e.to == edge.to && e.kind == edge.kind)
+        {
             return Err(TimelineError::EdgeExists(edge.from, edge.to));
         }
     }
@@ -310,7 +389,11 @@ pub struct CommandHistory {
 }
 
 impl CommandHistory {
-    pub fn apply(&mut self, graph: &mut TimelineGraph, command: TimelineCommand) -> Result<(), TimelineError> {
+    pub fn apply(
+        &mut self,
+        graph: &mut TimelineGraph,
+        command: TimelineCommand,
+    ) -> Result<(), TimelineError> {
         let inverse = apply_command(graph, command)?;
         self.undo_stack.push(inverse);
         self.redo_stack.clear();
@@ -355,7 +438,11 @@ pub fn migrate_sequence_tracks(sequence: &crate::Sequence) -> TimelineGraph {
         let mut binding = TrackBinding {
             id: track_id,
             name: legacy_track.name.clone(),
-            kind: if legacy_track.items.iter().all(|item| matches!(item.kind, crate::ItemKind::Audio { .. })) {
+            kind: if legacy_track
+                .items
+                .iter()
+                .all(|item| matches!(item.kind, crate::ItemKind::Audio { .. }))
+            {
                 TrackKind::Audio
             } else {
                 TrackKind::Video
@@ -396,7 +483,9 @@ pub fn migrate_sequence_tracks(sequence: &crate::Sequence) -> TimelineGraph {
                         timeline_range: FrameRange::new(item.from, item.duration_in_frames),
                         metadata: serde_json::json!({ "text": text, "color": color }),
                     },
-                    crate::ItemKind::Video { .. } | crate::ItemKind::Audio { .. } | crate::ItemKind::Image { .. } => TimelineNodeKind::Clip(clip),
+                    crate::ItemKind::Video { .. }
+                    | crate::ItemKind::Audio { .. }
+                    | crate::ItemKind::Image { .. } => TimelineNodeKind::Clip(clip),
                 },
                 locked: false,
                 metadata: Value::Null,

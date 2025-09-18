@@ -10,9 +10,9 @@ use tokio::sync::{mpsc, RwLock};
 use uuid::Uuid;
 use wasmtime::*;
 
+pub mod marketplace;
 pub mod python_bridge;
 pub mod wasm_runtime;
-pub mod marketplace;
 
 #[derive(Debug, Error)]
 pub enum PluginError {
@@ -216,7 +216,7 @@ impl PluginHost {
     pub fn new() -> Result<Self> {
         let wasm_config = Config::new();
         let wasm_engine = Engine::new(&wasm_config)?;
-        
+
         Ok(Self {
             plugins: Arc::new(RwLock::new(HashMap::new())),
             wasm_engine,
@@ -263,12 +263,16 @@ impl PluginHost {
             PluginRuntime::Python => {
                 let python_path = plugin_dir.join(&manifest.entry_point);
                 if !python_path.exists() {
-                    return Err(PluginError::LoadError("Python entry point not found".to_string()).into());
+                    return Err(
+                        PluginError::LoadError("Python entry point not found".to_string()).into(),
+                    );
                 }
                 PluginRuntimeHandle::Python(python_path)
             }
             PluginRuntime::Native => {
-                return Err(PluginError::LoadError("Native plugins not yet supported".to_string()).into());
+                return Err(
+                    PluginError::LoadError("Native plugins not yet supported".to_string()).into(),
+                );
             }
         };
 
@@ -282,7 +286,7 @@ impl PluginHost {
 
         let mut plugins = self.plugins.write().await;
         plugins.insert(plugin_id.clone(), loaded_plugin);
-        
+
         tracing::info!("Loaded plugin: {}", plugin_id);
         Ok(plugin_id)
     }
@@ -294,7 +298,8 @@ impl PluginHost {
         context: PluginContext,
     ) -> Result<PluginResult> {
         let plugins = self.plugins.read().await;
-        let plugin = plugins.get(plugin_id)
+        let plugin = plugins
+            .get(plugin_id)
             .ok_or_else(|| PluginError::NotFound(plugin_id.to_string()))?;
 
         // Create isolated execution environment
@@ -305,18 +310,25 @@ impl PluginHost {
         // Execute based on runtime
         match &plugin.runtime_handle {
             PluginRuntimeHandle::Wasm(module) => {
-                self.execute_wasm_plugin(module, &plugin.manifest, execution_context).await
+                self.execute_wasm_plugin(module, &plugin.manifest, execution_context)
+                    .await
             }
             PluginRuntimeHandle::Python(script_path) => {
                 if let Some(ref bridge) = self.python_bridge {
-                    bridge.execute_plugin(script_path, &plugin.manifest, execution_context).await
+                    bridge
+                        .execute_plugin(script_path, &plugin.manifest, execution_context)
+                        .await
                 } else {
-                    Err(PluginError::PythonBridge("Python bridge not initialized".to_string()).into())
+                    Err(
+                        PluginError::PythonBridge("Python bridge not initialized".to_string())
+                            .into(),
+                    )
                 }
             }
-            PluginRuntimeHandle::Native(_) => {
-                Err(PluginError::ExecutionError("Native plugins not yet supported".to_string()).into())
-            }
+            PluginRuntimeHandle::Native(_) => Err(PluginError::ExecutionError(
+                "Native plugins not yet supported".to_string(),
+            )
+            .into()),
         }
     }
 
@@ -335,9 +347,10 @@ impl PluginHost {
     /// Unload a plugin
     pub async fn unload_plugin(&self, plugin_id: &str) -> Result<()> {
         let mut plugins = self.plugins.write().await;
-        plugins.remove(plugin_id)
+        plugins
+            .remove(plugin_id)
             .ok_or_else(|| PluginError::NotFound(plugin_id.to_string()))?;
-        
+
         tracing::info!("Unloaded plugin: {}", plugin_id);
         Ok(())
     }
@@ -345,7 +358,7 @@ impl PluginHost {
     /// Scan directory for plugins and load them
     pub async fn scan_and_load_plugins(&self, plugins_dir: &Path) -> Result<Vec<String>> {
         let mut loaded_plugins = Vec::new();
-        
+
         if !plugins_dir.exists() {
             return Ok(loaded_plugins);
         }
@@ -355,7 +368,9 @@ impl PluginHost {
             if entry.file_type().await?.is_dir() {
                 match self.load_plugin(&entry.path()).await {
                     Ok(plugin_id) => loaded_plugins.push(plugin_id),
-                    Err(e) => tracing::warn!("Failed to load plugin from {:?}: {}", entry.path(), e),
+                    Err(e) => {
+                        tracing::warn!("Failed to load plugin from {:?}: {}", entry.path(), e)
+                    }
                 }
             }
         }
@@ -363,7 +378,11 @@ impl PluginHost {
         Ok(loaded_plugins)
     }
 
-    fn validate_plugin_signature(&self, _manifest: &PluginManifest, _plugin_dir: &Path) -> Result<()> {
+    fn validate_plugin_signature(
+        &self,
+        _manifest: &PluginManifest,
+        _plugin_dir: &Path,
+    ) -> Result<()> {
         // TODO: Implement plugin signature validation
         // For now, just return Ok if signature validation is required but not implemented
         tracing::warn!("Plugin signature validation not yet implemented");
@@ -379,7 +398,7 @@ impl PluginHost {
         // TODO: Implement WASM plugin execution
         // This would involve creating a WASM instance, setting up WASI, and calling the plugin
         tracing::warn!("WASM plugin execution not yet fully implemented");
-        
+
         Ok(PluginResult {
             success: true,
             output_items: vec![],
@@ -453,7 +472,7 @@ pub mod utils {
         description: &str,
     ) -> PluginParameter {
         let default_value = options.get(default_index).cloned().unwrap_or_default();
-        
+
         PluginParameter {
             name: name.to_string(),
             display_name: display_name.to_string(),

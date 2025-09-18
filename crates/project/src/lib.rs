@@ -15,10 +15,19 @@ pub struct ProjectDb {
 }
 
 impl ProjectDb {
-    pub fn begin_tx(&self) -> Result<Transaction<'_>> { Ok(self.conn.unchecked_transaction()?) }
+    pub fn begin_tx(&self) -> Result<Transaction<'_>> {
+        Ok(self.conn.unchecked_transaction()?)
+    }
 
-    pub fn upsert_asset_fast(&self, project_id: &str, kind: &str, src_abs: &Path) -> Result<String> {
-        self.insert_asset_row(project_id, kind, src_abs, None, None, None, None, None, None, None, None)
+    pub fn upsert_asset_fast(
+        &self,
+        project_id: &str,
+        kind: &str,
+        src_abs: &Path,
+    ) -> Result<String> {
+        self.insert_asset_row(
+            project_id, kind, src_abs, None, None, None, None, None, None, None, None,
+        )
     }
 
     pub fn mark_asset_ready(&self, asset_id: &str, ready: bool) -> Result<()> {
@@ -30,15 +39,36 @@ impl ProjectDb {
         Ok(())
     }
 
-    pub fn update_asset_analysis(&self, asset_id: &str, waveform_path: Option<&Path>, thumbs_path: Option<&Path>, proxy_path: Option<&Path>, seek_index_path: Option<&Path>) -> Result<()> {
-        if let Some(p) = waveform_path { self.conn.execute("INSERT OR REPLACE INTO cache(id, asset_id, kind, path_abs, created_at) VALUES(?1, ?2, 'waveform', ?3, strftime('%s','now'))", params![format!("wf-{}", asset_id), asset_id, p.to_string_lossy()])?; }
-        if let Some(p) = thumbs_path { self.conn.execute("INSERT OR REPLACE INTO cache(id, asset_id, kind, path_abs, created_at) VALUES(?1, ?2, 'thumbnail', ?3, strftime('%s','now'))", params![format!("th-{}", asset_id), asset_id, p.to_string_lossy()])?; }
-        if let Some(p) = proxy_path { self.conn.execute("INSERT OR REPLACE INTO proxies(id, asset_id, kind, path_abs, settings_hash, created_at) VALUES(?1, ?2, 'proxy', ?3, 'default', strftime('%s','now'))", params![format!("px-{}", asset_id), asset_id, p.to_string_lossy()])?; }
-        if let Some(p) = seek_index_path { self.conn.execute("INSERT OR REPLACE INTO cache(id, asset_id, kind, path_abs, created_at) VALUES(?1, ?2, 'analysis', ?3, strftime('%s','now'))", params![format!("sk-{}", asset_id), asset_id, p.to_string_lossy()])?; }
+    pub fn update_asset_analysis(
+        &self,
+        asset_id: &str,
+        waveform_path: Option<&Path>,
+        thumbs_path: Option<&Path>,
+        proxy_path: Option<&Path>,
+        seek_index_path: Option<&Path>,
+    ) -> Result<()> {
+        if let Some(p) = waveform_path {
+            self.conn.execute("INSERT OR REPLACE INTO cache(id, asset_id, kind, path_abs, created_at) VALUES(?1, ?2, 'waveform', ?3, strftime('%s','now'))", params![format!("wf-{}", asset_id), asset_id, p.to_string_lossy()])?;
+        }
+        if let Some(p) = thumbs_path {
+            self.conn.execute("INSERT OR REPLACE INTO cache(id, asset_id, kind, path_abs, created_at) VALUES(?1, ?2, 'thumbnail', ?3, strftime('%s','now'))", params![format!("th-{}", asset_id), asset_id, p.to_string_lossy()])?;
+        }
+        if let Some(p) = proxy_path {
+            self.conn.execute("INSERT OR REPLACE INTO proxies(id, asset_id, kind, path_abs, settings_hash, created_at) VALUES(?1, ?2, 'proxy', ?3, 'default', strftime('%s','now'))", params![format!("px-{}", asset_id), asset_id, p.to_string_lossy()])?;
+        }
+        if let Some(p) = seek_index_path {
+            self.conn.execute("INSERT OR REPLACE INTO cache(id, asset_id, kind, path_abs, created_at) VALUES(?1, ?2, 'analysis', ?3, strftime('%s','now'))", params![format!("sk-{}", asset_id), asset_id, p.to_string_lossy()])?;
+        }
         Ok(())
     }
 
-    pub fn enqueue_job(&self, job_id: &str, asset_id: &str, kind: &str, priority: i32) -> Result<()> {
+    pub fn enqueue_job(
+        &self,
+        job_id: &str,
+        asset_id: &str,
+        kind: &str,
+        priority: i32,
+    ) -> Result<()> {
         self.conn.execute(
             "INSERT INTO jobs(id, asset_id, kind, priority, status, created_at, updated_at) VALUES(?1, ?2, ?3, ?4, 'pending', strftime('%s','now'), strftime('%s','now'))",
             params![job_id, asset_id, kind, priority],
@@ -54,7 +84,9 @@ impl ProjectDb {
         Ok(())
     }
     pub fn open_or_create(path: &Path) -> Result<Self> {
-        if let Some(dir) = path.parent() { fs::create_dir_all(dir)?; }
+        if let Some(dir) = path.parent() {
+            fs::create_dir_all(dir)?;
+        }
         let conn = Connection::open(path)?;
         // Recommended PRAGMAs for local interactive app DB
         conn.pragma_update(None, "journal_mode", &"WAL")?;
@@ -64,12 +96,19 @@ impl ProjectDb {
         let _ = conn.pragma_update(None, "mmap_size", &"134217728"); // 128MB
         let _ = conn.pragma_update(None, "cache_size", &"-20000"); // ~20MB page cache
         apply_migrations(&conn)?;
-        Ok(Self { conn, path: path.to_path_buf() })
+        Ok(Self {
+            conn,
+            path: path.to_path_buf(),
+        })
     }
 
-    pub fn connection(&self) -> &Connection { &self.conn }
+    pub fn connection(&self) -> &Connection {
+        &self.conn
+    }
 
-    pub fn path(&self) -> &Path { &self.path }
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
 
     pub fn ensure_project(&self, id: &str, name: &str, base_path: Option<&Path>) -> Result<()> {
         let now = chrono::Utc::now().timestamp();
@@ -107,7 +146,10 @@ impl ProjectDb {
         let now = chrono::Utc::now().timestamp();
         let meta = std::fs::metadata(src_abs).ok();
         let size = meta.as_ref().and_then(|m| Some(m.len() as i64));
-        let mtime_ns = meta.and_then(|m| m.modified().ok()).and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map(|d| d.as_nanos() as i64);
+        let mtime_ns = meta
+            .and_then(|m| m.modified().ok())
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_nanos() as i64);
         self.conn.execute(
             "INSERT OR REPLACE INTO assets(id, project_id, kind, src_abs, src_rel, referenced, file_size, mtime_ns, width, height, duration_frames, fps_num, fps_den, audio_channels, sample_rate, created_at, updated_at) VALUES(?1, ?2, ?3, ?4, ?5, 1, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?15)",
             params![
@@ -144,11 +186,16 @@ impl ProjectDb {
                 .file_name()
                 .map(|s| s.to_string_lossy().into_owned())
                 .unwrap_or_else(|| src_abs.clone());
-            let wh = match (width, height) { (Some(w), Some(h)) => format!(" {}x{}", w, h), _ => String::new() };
+            let wh = match (width, height) {
+                (Some(w), Some(h)) => format!(" {}x{}", w, h),
+                _ => String::new(),
+            };
             Ok(format!("[{}] {}{}", kind, name, wh))
         })?;
         let mut out = Vec::new();
-        for r in rows { out.push(r?); }
+        for r in rows {
+            out.push(r?);
+        }
         Ok(out)
     }
 
@@ -171,7 +218,9 @@ impl ProjectDb {
             })
         })?;
         let mut out = Vec::new();
-        for r in rows { out.push(r?); }
+        for r in rows {
+            out.push(r?);
+        }
         Ok(out)
     }
 }
@@ -222,7 +271,10 @@ impl ProjectDb {
     }
 
     pub fn reset_running_jobs(&self) -> Result<()> {
-        self.conn.execute("UPDATE jobs SET status='pending' WHERE status='running'", [])?;
+        self.conn.execute(
+            "UPDATE jobs SET status='pending' WHERE status='running'",
+            [],
+        )?;
         Ok(())
     }
 
@@ -239,7 +291,9 @@ impl ProjectDb {
             })
         })?;
         let mut out = Vec::new();
-        for r in rows { out.push(r?); }
+        for r in rows {
+            out.push(r?);
+        }
         Ok(out)
     }
 }

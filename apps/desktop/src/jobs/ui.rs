@@ -82,7 +82,12 @@ impl App {
                                             ui.label(format!("{:?}", status));
                                         }
                                     }
-                                    if !matches!(ev.status, JobStatus::Done | JobStatus::Failed(_) | JobStatus::Canceled) {
+                                    if !matches!(
+                                        ev.status,
+                                        JobStatus::Done
+                                            | JobStatus::Failed(_)
+                                            | JobStatus::Canceled
+                                    ) {
                                         if ui.small_button("Cancel").clicked() {
                                             if let Some(j) = &self.jobs {
                                                 j.cancel_job(&ev.id);

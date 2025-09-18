@@ -35,11 +35,13 @@ pub struct Fps {
 }
 
 impl Fps {
-    pub const fn new(num: u32, den: u32) -> Self { Self { num, den } }
+    pub const fn new(num: u32, den: u32) -> Self {
+        Self { num, den }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "type")] 
+#[serde(tag = "type")]
 pub enum ItemKind {
     #[serde(rename = "solid")]
     Solid { color: String },
@@ -70,7 +72,9 @@ pub enum ItemKind {
     },
 }
 
-fn default_rate() -> f32 { 1.0 }
+fn default_rate() -> f32 {
+    1.0
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Item {
@@ -100,7 +104,13 @@ pub struct Sequence {
 }
 
 impl Sequence {
-    pub fn new(name: impl Into<String>, width: u32, height: u32, fps: Fps, duration_in_frames: Frame) -> Self {
+    pub fn new(
+        name: impl Into<String>,
+        width: u32,
+        height: u32,
+        fps: Fps,
+        duration_in_frames: Frame,
+    ) -> Self {
         Self {
             name: name.into(),
             width,
@@ -112,5 +122,7 @@ impl Sequence {
         }
     }
 
-    pub fn add_track(&mut self, track: Track) { self.tracks.push(track); }
+    pub fn add_track(&mut self, track: Track) {
+        self.tracks.push(track);
+    }
 }

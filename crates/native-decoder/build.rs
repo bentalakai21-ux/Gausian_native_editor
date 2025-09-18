@@ -10,7 +10,7 @@ fn main() {
         println!("cargo:rustc-link-lib=framework=IOSurface");
         // Align deployment target with the top-level linker flags
         println!("cargo:rustc-env=MACOSX_DEPLOYMENT_TARGET=11.0");
-        
+
         // Compile the Obj-C shim
         let shim_path = std::path::Path::new("src/avfoundation_shim.m");
         if shim_path.exists() {

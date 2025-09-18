@@ -1,24 +1,43 @@
 pub mod state;
 pub mod ui;
 
-pub(crate) use state::{PreviewShaderMode, PreviewState, PreviewYuvCallback};
+pub(crate) use state::{PreviewShaderMode, PreviewState, StreamMetadata, StreamSlot};
 
 use serde_json::Value;
-use timeline_crate::{ClipNode, FrameRange, TimelineGraph, TimelineNode, TimelineNodeKind, TrackKind};
+use timeline_crate::{
+    ClipNode, FrameRange, TimelineGraph, TimelineNode, TimelineNodeKind, TrackKind,
+};
 
 use crate::VisualSource;
+use tracing::trace;
 
 pub(crate) fn visual_source_at(graph: &TimelineGraph, playhead: i64) -> Option<VisualSource> {
     for binding in graph.tracks.iter().rev() {
-        if matches!(binding.kind, TrackKind::Audio) { continue; }
+        if matches!(binding.kind, TrackKind::Audio) {
+            continue;
+        }
         for node_id in binding.node_ids.iter() {
             let node = graph.nodes.get(node_id)?;
-            let Some(range) = node_frame_range(node) else { continue; };
-            if playhead < range.start || playhead >= range.end() { continue; }
+            let Some(range) = node_frame_range(node) else {
+                continue;
+            };
+            if playhead < range.start || playhead >= range.end() {
+                continue;
+            }
             match &node.kind {
-                TimelineNodeKind::Clip(clip) => return clip_source(binding, clip),
-                TimelineNodeKind::Generator { generator_id, metadata, .. } => {
-                    if let Some(src) = generator_source(generator_id, metadata) { return Some(src); }
+                TimelineNodeKind::Clip(clip) => {
+                    let asset = clip.asset_id.as_deref().unwrap_or("<unknown>");
+                    trace!(node_id = ?node_id, asset, playhead, "preview resolver matched clip");
+                    return clip_source(binding, clip);
+                }
+                TimelineNodeKind::Generator {
+                    generator_id,
+                    metadata,
+                    ..
+                } => {
+                    if let Some(src) = generator_source(generator_id, metadata) {
+                        return Some(src);
+                    }
                 }
                 _ => {}
             }
@@ -44,10 +63,19 @@ fn clip_source(binding: &timeline_crate::TrackBinding, clip: &ClipNode) -> Optio
 fn generator_source(generator_id: &str, metadata: &Value) -> Option<VisualSource> {
     match generator_id {
         "solid" => {
-            let color = metadata.get("color").and_then(|v| v.as_str()).unwrap_or("#000000");
-            Some(VisualSource { path: format!("solid:{}", color), is_image: true })
+            let color = metadata
+                .get("color")
+                .and_then(|v| v.as_str())
+                .unwrap_or("#000000");
+            Some(VisualSource {
+                path: format!("solid:{}", color),
+                is_image: true,
+            })
         }
-        "text" => Some(VisualSource { path: "text://generator".into(), is_image: true }),
+        "text" => Some(VisualSource {
+            path: "text://generator".into(),
+            is_image: true,
+        }),
         _ => None,
     }
 }

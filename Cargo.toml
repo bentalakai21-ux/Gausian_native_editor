@@ -13,3 +13,14 @@ members = [
 ]
 
 resolver = "2"
+
+[profile.dev]
+# Reduce macOS file explosion and disk usage.
+split-debuginfo = "packed"
+# Disable incremental to avoid large per-crate caches in target/.
+incremental = false
+
+[profile.release]
+# Keep release lean; ensure no debug info and packed split if any.
+debug = 0
+split-debuginfo = "packed"

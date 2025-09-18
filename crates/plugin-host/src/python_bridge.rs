@@ -21,10 +21,10 @@ impl PythonBridge {
     pub fn new() -> Result<Self> {
         // Try to find Python executable
         let python_executable = Self::find_python_executable()?;
-        
+
         // Verify Python installation and required packages
         Self::verify_python_environment(&python_executable)?;
-        
+
         Ok(Self {
             python_executable,
             base_env: std::env::vars().collect(),
@@ -72,24 +72,27 @@ impl PythonBridge {
         for (key, value) in &self.base_env {
             cmd.env(key, value);
         }
-        
+
         // Add plugin-specific environment
         cmd.env("PLUGIN_NAME", &manifest.name)
             .env("PLUGIN_VERSION", &manifest.version)
             .env("TEMP_DIR", &context.temp_dir)
-            .env("PYTHONPATH", script_path.parent().unwrap_or_else(|| Path::new(".")));
+            .env(
+                "PYTHONPATH",
+                script_path.parent().unwrap_or_else(|| Path::new(".")),
+            );
 
         // Execute with timeout
         let execution_result = timeout(self.max_execution_time, async {
             let mut child = cmd.spawn()?;
-            
+
             // Capture stdout and stderr
             let stdout = child.stdout.take().unwrap();
             let stderr = child.stderr.take().unwrap();
-            
+
             let (stdout_tx, mut stdout_rx) = mpsc::channel(100);
             let (stderr_tx, mut stderr_rx) = mpsc::channel(100);
-            
+
             // Spawn tasks to read stdout and stderr
             tokio::spawn(async move {
                 let mut reader = BufReader::new(stdout);
@@ -99,7 +102,7 @@ impl PythonBridge {
                     line.clear();
                 }
             });
-            
+
             tokio::spawn(async move {
                 let mut reader = BufReader::new(stderr);
                 let mut line = String::new();
@@ -111,7 +114,7 @@ impl PythonBridge {
 
             let mut stdout_lines = Vec::new();
             let mut stderr_lines = Vec::new();
-            
+
             // Collect output while process is running
             loop {
                 tokio::select! {
@@ -139,25 +142,25 @@ impl PythonBridge {
                     }
                 }
             }
-        }).await;
+        })
+        .await;
 
         match execution_result {
             Ok(Ok((stdout_lines, stderr_lines))) => {
                 // Read the output file
                 let result = if temp_output.exists() {
                     let output_content = tokio::fs::read_to_string(&temp_output).await?;
-                    serde_json::from_str::<PluginResult>(&output_content)
-                        .unwrap_or_else(|e| {
-                            error!("Failed to parse plugin output: {}", e);
-                            PluginResult {
-                                success: false,
-                                output_items: vec![],
-                                modified_sequence: None,
-                                artifacts: vec![],
-                                logs: stderr_lines,
-                                error_message: Some(format!("Failed to parse output: {}", e)),
-                            }
-                        })
+                    serde_json::from_str::<PluginResult>(&output_content).unwrap_or_else(|e| {
+                        error!("Failed to parse plugin output: {}", e);
+                        PluginResult {
+                            success: false,
+                            output_items: vec![],
+                            modified_sequence: None,
+                            artifacts: vec![],
+                            logs: stderr_lines,
+                            error_message: Some(format!("Failed to parse output: {}", e)),
+                        }
+                    })
                 } else {
                     // No output file, create a basic result
                     PluginResult {
@@ -187,7 +190,8 @@ impl PythonBridge {
             Err(_) => Err(PluginError::Timeout(format!(
                 "Plugin execution timed out after {:?}",
                 self.max_execution_time
-            )).into()),
+            ))
+            .into()),
         }
     }
 
@@ -221,7 +225,10 @@ except ImportError:
             return Ok(()); // No requirements file
         }
 
-        debug!("Installing Python dependencies from {:?}", requirements_file);
+        debug!(
+            "Installing Python dependencies from {:?}",
+            requirements_file
+        );
 
         let output = TokioCommand::new(&self.python_executable)
             .arg("-m")
@@ -238,7 +245,8 @@ except ImportError:
             return Err(PluginError::PythonBridge(format!(
                 "Failed to install dependencies: {}",
                 stderr
-            )).into());
+            ))
+            .into());
         }
 
         Ok(())
@@ -246,8 +254,15 @@ except ImportError:
 
     fn find_python_executable() -> Result<String> {
         // Try different Python executable names
-        let candidates = ["python3", "python", "python3.9", "python3.10", "python3.11", "python3.12"];
-        
+        let candidates = [
+            "python3",
+            "python",
+            "python3.9",
+            "python3.10",
+            "python3.11",
+            "python3.12",
+        ];
+
         for candidate in &candidates {
             if let Ok(output) = std::process::Command::new(candidate)
                 .arg("--version")
@@ -256,7 +271,11 @@ except ImportError:
                 if output.status.success() {
                     let version_str = String::from_utf8_lossy(&output.stdout);
                     if version_str.contains("Python 3.") {
-                        debug!("Found Python executable: {} ({})", candidate, version_str.trim());
+                        debug!(
+                            "Found Python executable: {} ({})",
+                            candidate,
+                            version_str.trim()
+                        );
                         return Ok(candidate.to_string());
                     }
                 }
@@ -278,7 +297,8 @@ except ImportError:
             return Err(PluginError::PythonBridge(format!(
                 "Python environment verification failed: {}",
                 stderr
-            )).into());
+            ))
+            .into());
         }
 
         debug!("Python environment verified");
@@ -289,13 +309,11 @@ except ImportError:
 /// Helper functions for Python plugin development
 pub mod python_helpers {
     use super::*;
-    
+
     /// Generate a basic Python plugin template
-    pub fn generate_python_plugin_template(
-        plugin_name: &str,
-        plugin_type: &str,
-    ) -> String {
-        format!(r#"#!/usr/bin/env python3
+    pub fn generate_python_plugin_template(plugin_name: &str, plugin_type: &str) -> String {
+        format!(
+            r#"#!/usr/bin/env python3
 """
 {plugin_name} - A {plugin_type} plugin for Gausian Native Editor
 """
@@ -384,7 +402,10 @@ def main():
 
 if __name__ == "__main__":
     main()
-"#, plugin_name = plugin_name, plugin_type = plugin_type)
+"#,
+            plugin_name = plugin_name,
+            plugin_type = plugin_type
+        )
     }
 
     /// Generate requirements.txt for a Python plugin

@@ -9,11 +9,15 @@ use crate::Frame;
 pub struct NodeId(pub Uuid);
 
 impl NodeId {
-    pub fn new() -> Self { Self(Uuid::new_v4()) }
+    pub fn new() -> Self {
+        Self(Uuid::new_v4())
+    }
 }
 
 impl fmt::Display for NodeId {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { write!(f, "{}", self.0) }
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
@@ -21,11 +25,15 @@ impl fmt::Display for NodeId {
 pub struct TrackId(pub Uuid);
 
 impl TrackId {
-    pub fn new() -> Self { Self(Uuid::new_v4()) }
+    pub fn new() -> Self {
+        Self(Uuid::new_v4())
+    }
 }
 
 impl fmt::Display for TrackId {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { write!(f, "{}", self.0) }
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
@@ -33,11 +41,15 @@ impl fmt::Display for TrackId {
 pub struct LaneId(pub Uuid);
 
 impl LaneId {
-    pub fn new() -> Self { Self(Uuid::new_v4()) }
+    pub fn new() -> Self {
+        Self(Uuid::new_v4())
+    }
 }
 
 impl fmt::Display for LaneId {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { write!(f, "{}", self.0) }
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -47,8 +59,12 @@ pub struct FrameRange {
 }
 
 impl FrameRange {
-    pub fn new(start: Frame, duration: Frame) -> Self { Self { start, duration } }
-    pub fn end(&self) -> Frame { self.start + self.duration }
+    pub fn new(start: Frame, duration: Frame) -> Self {
+        Self { start, duration }
+    }
+    pub fn end(&self) -> Frame {
+        self.start + self.duration
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -64,7 +80,9 @@ pub struct ClipNode {
     pub metadata: serde_json::Value,
 }
 
-fn default_playback_rate() -> f32 { 1.0 }
+fn default_playback_rate() -> f32 {
+    1.0
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct TransitionNode {
@@ -85,7 +103,9 @@ pub enum TransitionKind {
 }
 
 impl Default for TransitionKind {
-    fn default() -> Self { Self::Dissolve }
+    fn default() -> Self {
+        Self::Dissolve
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -112,7 +132,9 @@ pub enum AutomationInterpolation {
 }
 
 impl Default for AutomationInterpolation {
-    fn default() -> Self { Self::Linear }
+    fn default() -> Self {
+        Self::Linear
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -134,7 +156,9 @@ pub enum KeyframeEasing {
 }
 
 impl Default for KeyframeEasing {
-    fn default() -> Self { Self::Linear }
+    fn default() -> Self {
+        Self::Linear
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -153,7 +177,7 @@ pub struct TimelineNode {
 pub enum TimelineNodeKind {
     Clip(ClipNode),
     Transition(TransitionNode),
-    Generator { 
+    Generator {
         generator_id: String,
         timeline_range: FrameRange,
         #[serde(default)]
@@ -200,7 +224,9 @@ pub enum TrackKind {
 }
 
 impl Default for TrackKind {
-    fn default() -> Self { Self::Video }
+    fn default() -> Self {
+        Self::Video
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

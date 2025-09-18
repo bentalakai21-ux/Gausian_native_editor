@@ -1,9 +1,9 @@
-use std::sync::{Arc, Mutex};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+use std::sync::{Arc, Mutex};
 
 #[derive(Clone)]
 pub struct AudioBuffer {
-    pub samples: Vec<f32>,       // interleaved
+    pub samples: Vec<f32>, // interleaved
     pub channels: u16,
     pub sample_rate: u32,
     pub duration_sec: f32,
@@ -11,7 +11,7 @@ pub struct AudioBuffer {
 
 #[derive(Clone)]
 pub struct ActiveAudioClip {
-    pub start_tl_sec: f64,   // timeline position
+    pub start_tl_sec: f64, // timeline position
     pub start_media_sec: f64,
     pub duration_sec: f64,
     pub buf: Arc<AudioBuffer>,
@@ -34,7 +34,9 @@ pub struct AudioEngine {
 impl AudioEngine {
     pub fn new() -> anyhow::Result<Self> {
         let host = cpal::default_host();
-        let device = host.default_output_device().ok_or_else(|| anyhow::anyhow!("no audio device"))?;
+        let device = host
+            .default_output_device()
+            .ok_or_else(|| anyhow::anyhow!("no audio device"))?;
         let mut config = device.default_output_config()?.config();
         // Force stereo f32 if needed:
         config.channels = 2;
@@ -56,7 +58,8 @@ impl AudioEngine {
                 let ch = 2usize;
                 let frames = data.len() / ch;
                 for i in 0..frames {
-                    let t = m.anchor_timeline_sec + (m.device_frame_cursor as f64) / (m.device_sr as f64);
+                    let t = m.anchor_timeline_sec
+                        + (m.device_frame_cursor as f64) / (m.device_sr as f64);
                     let mut l = 0.0f32;
                     let mut r = 0.0f32;
                     if m.playing {
@@ -80,7 +83,10 @@ impl AudioEngine {
         )?;
         stream.play()?;
 
-        Ok(Self { stream: Some(stream), mixer })
+        Ok(Self {
+            stream: Some(stream),
+            mixer,
+        })
     }
 
     // Called when pressing play:
@@ -105,7 +111,9 @@ impl AudioEngine {
 }
 
 fn sample_stereo(buf: &AudioBuffer, t_sec: f32, _out_sr: u32) -> (f32, f32) {
-    if buf.samples.is_empty() { return (0.0, 0.0); }
+    if buf.samples.is_empty() {
+        return (0.0, 0.0);
+    }
     // Assume buffer at buf.sample_rate; simple linear interpolation
     let in_sr = buf.sample_rate;
     let t_in = t_sec * in_sr as f32; // time in input frames (float)
@@ -115,13 +123,13 @@ fn sample_stereo(buf: &AudioBuffer, t_sec: f32, _out_sr: u32) -> (f32, f32) {
     let ch = buf.channels as usize;
 
     let fetch = |frame: usize, c: usize| -> f32 {
-        let f = frame.min((buf.samples.len()/ch).saturating_sub(1));
-        buf.samples[f*ch + c]
+        let f = frame.min((buf.samples.len() / ch).saturating_sub(1));
+        buf.samples[f * ch + c]
     };
     let l0 = fetch(i0, 0);
-    let r0 = fetch(i0, if ch>1 {1} else {0});
+    let r0 = fetch(i0, if ch > 1 { 1 } else { 0 });
     let l1 = fetch(i1, 0);
-    let r1 = fetch(i1, if ch>1 {1} else {0});
+    let r1 = fetch(i1, if ch > 1 { 1 } else { 0 });
     let l = l0 + (l1 - l0) * frac;
     let r = r0 + (r1 - r0) * frac;
     (l, r)

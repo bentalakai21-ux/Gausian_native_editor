@@ -1,14 +1,14 @@
 //! Native video decoder backends for macOS using VideoToolbox
-//! 
+//!
 //! This crate provides hardware-accelerated video decoding using Apple's VideoToolbox framework.
 //! It supports both CPU plane copies (Phase 1) and zero-copy via IOSurface (Phase 2).
 
 use anyhow::Result;
 // Define YUV pixel formats locally to avoid cyclic dependency
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum YuvPixFmt { 
-    Nv12, 
-    P010 
+pub enum YuvPixFmt {
+    Nv12,
+    P010,
 }
 use std::path::Path;
 use std::sync::Arc;
@@ -56,36 +56,44 @@ pub struct IOSurfaceFrame {
 pub trait NativeVideoDecoder: Send + Sync {
     /// Decode a frame at the specified timestamp
     fn decode_frame(&mut self, timestamp: f64) -> Result<Option<VideoFrame>>;
-    
+
     /// Decode a frame with zero-copy IOSurface (Phase 2)
     #[cfg(target_os = "macos")]
     fn decode_frame_zero_copy(&mut self, _timestamp: f64) -> Result<Option<IOSurfaceFrame>> {
         // IOSurface zero-copy not yet implemented
         Err(anyhow::anyhow!("IOSurface zero-copy not yet implemented"))
     }
-    
+
     /// Get video properties
     fn get_properties(&self) -> VideoProperties;
-    
+
     /// Seek to a specific timestamp
     fn seek_to(&mut self, timestamp: f64) -> Result<()>;
-    
+
     /// Check if zero-copy mode is supported
     fn supports_zero_copy(&self) -> bool {
         false
     }
-    
+
     /// Get ring buffer length for HUD display (optional)
-    fn ring_len(&self) -> usize { 0 }
-    
+    fn ring_len(&self) -> usize {
+        0
+    }
+
     /// Get callback frame count for HUD display (optional)
-    fn cb_frames(&self) -> usize { 0 }
-    
+    fn cb_frames(&self) -> usize {
+        0
+    }
+
     /// Get last callback PTS for HUD display (optional)
-    fn last_cb_pts(&self) -> f64 { f64::NAN }
-    
+    fn last_cb_pts(&self) -> f64 {
+        f64::NAN
+    }
+
     /// Get fed samples count for HUD display (optional)
-    fn fed_samples(&self) -> usize { 0 }
+    fn fed_samples(&self) -> usize {
+        0
+    }
 }
 
 /// Video properties
@@ -128,7 +136,7 @@ pub fn create_decoder<P: AsRef<Path>>(
     {
         macos::create_videotoolbox_decoder(path, config)
     }
-    
+
     #[cfg(not(target_os = "macos"))]
     {
         fallback::create_fallback_decoder(path, config)
@@ -141,7 +149,7 @@ pub fn is_native_decoding_available() -> bool {
     {
         macos::is_videotoolbox_available()
     }
-    
+
     #[cfg(not(target_os = "macos"))]
     {
         false

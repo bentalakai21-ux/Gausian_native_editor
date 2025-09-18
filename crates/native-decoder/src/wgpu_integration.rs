@@ -1,5 +1,5 @@
 //! WGPU integration for zero-copy IOSurface rendering
-//! 
+//!
 //! This module provides integration between IOSurface frames and WGPU external textures
 //! for zero-copy video rendering on macOS.
 
@@ -9,13 +9,13 @@ use anyhow::Result;
 use std::sync::Arc;
 
 #[cfg(target_os = "macos")]
-use wgpu::*;
+use core_foundation::base::TCFType;
 #[cfg(target_os = "macos")]
 use std::num::NonZeroU32;
 #[cfg(target_os = "macos")]
 use std::slice;
 #[cfg(target_os = "macos")]
-use core_foundation::base::TCFType;
+use wgpu::*;
 
 #[cfg(target_os = "macos")]
 extern "C" {
@@ -24,12 +24,17 @@ extern "C" {
     fn avf_iosurface_width_of_plane(s: *mut std::ffi::c_void, plane: usize) -> usize;
     fn avf_iosurface_height_of_plane(s: *mut std::ffi::c_void, plane: usize) -> usize;
     fn avf_iosurface_bytes_per_row_of_plane(s: *mut std::ffi::c_void, plane: usize) -> usize;
-    fn avf_iosurface_base_address_of_plane(s: *mut std::ffi::c_void, plane: usize) -> *const std::ffi::c_void;
+    fn avf_iosurface_base_address_of_plane(
+        s: *mut std::ffi::c_void,
+        plane: usize,
+    ) -> *const std::ffi::c_void;
 }
 
 #[cfg(target_os = "macos")]
 #[inline]
-fn align_up(x: u32, align: u32) -> u32 { (x + align - 1) & !(align - 1) }
+fn align_up(x: u32, align: u32) -> u32 {
+    (x + align - 1) & !(align - 1)
+}
 #[cfg(target_os = "macos")]
 use tracing::{debug, info};
 
@@ -74,7 +79,7 @@ impl IOSurfaceTexture {
         // Copy IOSurface data to texture
         // In a real implementation, we would use copy_external_texture_to_texture
         // or similar WGPU methods for zero-copy operations
-        
+
         Ok(Self {
             texture,
             view,
@@ -90,7 +95,7 @@ impl IOSurfaceTexture {
         // 1. Lock the IOSurface
         // 2. Copy data directly to GPU memory
         // 3. Unlock the IOSurface
-        
+
         // For now, this is a placeholder
         info!("Updating IOSurface texture with new frame data");
         Ok(())
@@ -110,8 +115,8 @@ impl IOSurfaceTexture {
 /// Two-plane NV12 GPU textures used by the preview renderer
 #[cfg(target_os = "macos")]
 pub struct GpuYuv {
-    pub y_tex: std::sync::Arc<Texture>,      // R8Unorm WxH
-    pub uv_tex: std::sync::Arc<Texture>,     // Rg8Unorm (W/2)x(H/2)
+    pub y_tex: std::sync::Arc<Texture>,  // R8Unorm WxH
+    pub uv_tex: std::sync::Arc<Texture>, // Rg8Unorm (W/2)x(H/2)
 }
 
 #[cfg(target_os = "macos")]
@@ -119,10 +124,16 @@ impl GpuYuv {
     /// Import NV12 planes from an IOSurface into two textures.
     /// Assumes textures are created with COPY_DST | TEXTURE_BINDING usages,
     /// with formats R8Unorm for Y and Rg8Unorm for UV.
-    pub fn import_from_iosurface(&self, queue: &Queue, frame: &IOSurfaceFrame) -> anyhow::Result<()> {
+    pub fn import_from_iosurface(
+        &self,
+        queue: &Queue,
+        frame: &IOSurfaceFrame,
+    ) -> anyhow::Result<()> {
         // Obtain raw IOSurfaceRef
         let s_ref = frame.surface.as_concrete_TypeRef() as *mut std::ffi::c_void;
-        if s_ref.is_null() { return Ok(()); }
+        if s_ref.is_null() {
+            return Ok(());
+        }
 
         unsafe { avf_iosurface_lock_readonly(s_ref) };
 
@@ -138,7 +149,10 @@ impl GpuYuv {
         let src_bpr1 = unsafe { avf_iosurface_bytes_per_row_of_plane(s_ref, 1) } as u32;
         let base1 = unsafe { avf_iosurface_base_address_of_plane(s_ref, 1) } as *const u8;
 
-        debug!("IOSurface planes: Y {}x{} bpr={} | UV {}x{} bpr={}", w0, h0, src_bpr0, w1, h1, src_bpr1);
+        debug!(
+            "IOSurface planes: Y {}x{} bpr={} | UV {}x{} bpr={}",
+            w0, h0, src_bpr0, w1, h1, src_bpr1
+        );
 
         // Convert base addresses to slices
         let y_src = unsafe { slice::from_raw_parts(base0, (src_bpr0 * h0) as usize) };
@@ -155,9 +169,13 @@ impl GpuYuv {
             for row in 0..h0 {
                 let src_off = (row * src_bpr0) as usize;
                 let dst_off = (row * dst_bpr0) as usize;
-                packed[dst_off .. dst_off + (w0 as usize)].copy_from_slice(&y_src[src_off .. src_off + (w0 as usize)]);
+                packed[dst_off..dst_off + (w0 as usize)]
+                    .copy_from_slice(&y_src[src_off..src_off + (w0 as usize)]);
             }
-            debug!("NV12 Y repack due to alignment: {} -> {}", src_bpr0, dst_bpr0);
+            debug!(
+                "NV12 Y repack due to alignment: {} -> {}",
+                src_bpr0, dst_bpr0
+            );
             (Some(packed), dst_bpr0)
         };
         let y_bytes: &[u8] = y_owned.as_deref().unwrap_or(y_src);
@@ -171,38 +189,64 @@ impl GpuYuv {
             for row in 0..h1 {
                 let src_off = (row * src_bpr1) as usize;
                 let dst_off = (row * dst_bpr1) as usize;
-                packed[dst_off .. dst_off + (row_bytes_uv as usize)].copy_from_slice(&uv_src[src_off .. src_off + (row_bytes_uv as usize)]);
+                packed[dst_off..dst_off + (row_bytes_uv as usize)]
+                    .copy_from_slice(&uv_src[src_off..src_off + (row_bytes_uv as usize)]);
             }
-            debug!("NV12 UV repack due to alignment: {} -> {}", src_bpr1, dst_bpr1);
+            debug!(
+                "NV12 UV repack due to alignment: {} -> {}",
+                src_bpr1, dst_bpr1
+            );
             (Some(packed), dst_bpr1)
         };
         let uv_bytes: &[u8] = uv_owned.as_deref().unwrap_or(uv_src);
 
         // Upload Y
         queue.write_texture(
-            ImageCopyTexture { texture: &self.y_tex, mip_level: 0, origin: Origin3d::ZERO, aspect: TextureAspect::All },
+            ImageCopyTexture {
+                texture: &self.y_tex,
+                mip_level: 0,
+                origin: Origin3d::ZERO,
+                aspect: TextureAspect::All,
+            },
             y_bytes,
             ImageDataLayout {
                 offset: 0,
                 bytes_per_row: Some(y_bpr_use),
                 rows_per_image: Some(h0),
             },
-            Extent3d { width: w0, height: h0, depth_or_array_layers: 1 },
+            Extent3d {
+                width: w0,
+                height: h0,
+                depth_or_array_layers: 1,
+            },
         );
 
         // Upload UV
         queue.write_texture(
-            ImageCopyTexture { texture: &self.uv_tex, mip_level: 0, origin: Origin3d::ZERO, aspect: TextureAspect::All },
+            ImageCopyTexture {
+                texture: &self.uv_tex,
+                mip_level: 0,
+                origin: Origin3d::ZERO,
+                aspect: TextureAspect::All,
+            },
             uv_bytes,
             ImageDataLayout {
                 offset: 0,
                 bytes_per_row: Some(uv_bpr_use),
                 rows_per_image: Some(h1),
             },
-            Extent3d { width: w1, height: h1, depth_or_array_layers: 1 },
+            Extent3d {
+                width: w1,
+                height: h1,
+                depth_or_array_layers: 1,
+            },
         );
 
-        debug!("NV12 wrote bytes: Y={} UV={}", (y_bpr_use as usize) * (h0 as usize), (uv_bpr_use as usize) * (h1 as usize));
+        debug!(
+            "NV12 wrote bytes: Y={} UV={}",
+            (y_bpr_use as usize) * (h0 as usize),
+            (uv_bpr_use as usize) * (h1 as usize)
+        );
 
         unsafe { avf_iosurface_unlock(s_ref) };
         Ok(())
@@ -312,11 +356,7 @@ impl IOSurfaceRenderPipeline {
     }
 
     /// Create a bind group for an IOSurface texture
-    pub fn create_bind_group(
-        &self,
-        device: &Device,
-        texture_view: &TextureView,
-    ) -> BindGroup {
+    pub fn create_bind_group(&self, device: &Device, texture_view: &TextureView) -> BindGroup {
         device.create_bind_group(&BindGroupDescriptor {
             label: Some("IOSurface Bind Group"),
             layout: &self.bind_group_layout,
@@ -341,7 +381,7 @@ impl ZeroCopyVideoRenderer {
     /// Create a new zero-copy video renderer
     pub fn new(device: Arc<Device>, queue: Arc<Queue>) -> Result<Self> {
         let pipeline = IOSurfaceRenderPipeline::new(&device)?;
-        
+
         Ok(Self {
             pipeline,
             device,
@@ -357,17 +397,13 @@ impl ZeroCopyVideoRenderer {
         output_texture: &TextureView,
     ) -> Result<()> {
         // Create IOSurface texture
-        let iosurface_texture = IOSurfaceTexture::from_iosurface_frame(
-            &self.device,
-            &self.queue,
-            frame,
-        )?;
+        let iosurface_texture =
+            IOSurfaceTexture::from_iosurface_frame(&self.device, &self.queue, frame)?;
 
         // Create bind group
-        let bind_group = self.pipeline.create_bind_group(
-            &self.device,
-            &iosurface_texture.view,
-        );
+        let bind_group = self
+            .pipeline
+            .create_bind_group(&self.device, &iosurface_texture.view);
 
         // Create render pass
         let mut render_pass = encoder.begin_render_pass(&RenderPassDescriptor {
@@ -388,12 +424,12 @@ impl ZeroCopyVideoRenderer {
         // Set pipeline and bind group
         render_pass.set_pipeline(&self.pipeline.pipeline);
         render_pass.set_bind_group(0, &bind_group, &[]);
-        
+
         // Draw triangle
         render_pass.draw(0..3, 0..1);
-        
+
         drop(render_pass);
-        
+
         Ok(())
     }
 }
@@ -406,7 +442,7 @@ impl ZeroCopyVideoRenderer {
     pub fn new(_device: Arc<wgpu::Device>, _queue: Arc<wgpu::Queue>) -> Result<Self> {
         Ok(Self)
     }
-    
+
     pub fn render_frame(
         &self,
         _encoder: &mut wgpu::CommandEncoder,

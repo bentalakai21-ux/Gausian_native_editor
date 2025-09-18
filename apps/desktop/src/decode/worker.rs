@@ -11,11 +11,16 @@ use media_io::YuvPixFmt;
 pub(crate) const PREFETCH_BUDGET_PER_TICK: usize = 6;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum PlayState { Paused, Seeking, Playing, Scrubbing }
+pub(crate) enum PlayState {
+    Paused,
+    Seeking,
+    Playing,
+    Scrubbing,
+}
 
 pub(crate) struct EngineState {
     pub(crate) state: PlayState,
-    pub(crate) rate: f32,      // 1.0 by default
+    pub(crate) rate: f32, // 1.0 by default
     pub(crate) target_pts: f64,
 }
 
@@ -63,12 +68,26 @@ pub(crate) fn spawn_worker(path: &str) -> DecodeWorkerRuntime {
     let path = path.to_string();
     let handle = thread::spawn(move || {
         // Initialize decoders
-        let cfg_cpu = DecoderConfig { hardware_acceleration: true, preferred_format: Some(NativeYuvPixFmt::Nv12), zero_copy: false };
-        let mut cpu_dec = match create_decoder(&path, cfg_cpu) { Ok(d) => d, Err(e) => { eprintln!("[worker] create_decoder CPU failed: {e}"); return; } };
+        let cfg_cpu = DecoderConfig {
+            hardware_acceleration: true,
+            preferred_format: Some(NativeYuvPixFmt::Nv12),
+            zero_copy: false,
+        };
+        let mut cpu_dec = match create_decoder(&path, cfg_cpu) {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("[worker] create_decoder CPU failed: {e}");
+                return;
+            }
+        };
         // For now, worker outputs CPU NV12/P010 frames only (zero-copy can be added later)
 
         let props = cpu_dec.get_properties();
-        let fps = if props.frame_rate > 0.0 { props.frame_rate } else { 30.0 };
+        let fps = if props.frame_rate > 0.0 {
+            props.frame_rate
+        } else {
+            30.0
+        };
         let frame_dur = if fps > 0.0 { 1.0 / fps } else { 1.0 / 30.0 };
 
         let mut mode = PlayState::Paused;
@@ -88,10 +107,22 @@ pub(crate) fn spawn_worker(path: &str) -> DecodeWorkerRuntime {
                 f = cpu_dec.decode_frame(target).ok().flatten();
             }
             if let Some(vf) = f {
-                let fmt = match vf.format { NativeYuvPixFmt::Nv12 => YuvPixFmt::Nv12, NativeYuvPixFmt::P010 => YuvPixFmt::P010 };
+                let fmt = match vf.format {
+                    NativeYuvPixFmt::Nv12 => YuvPixFmt::Nv12,
+                    NativeYuvPixFmt::P010 => YuvPixFmt::P010,
+                };
                 let y: Arc<[u8]> = Arc::from(vf.y_plane.into_boxed_slice());
                 let uv: Arc<[u8]> = Arc::from(vf.uv_plane.into_boxed_slice());
-                return Some(VideoFrameOut { pts: vf.timestamp, props: VideoProps { w: vf.width, h: vf.height, fps, fmt }, payload: FramePayload::Cpu { y, uv } });
+                return Some(VideoFrameOut {
+                    pts: vf.timestamp,
+                    props: VideoProps {
+                        w: vf.width,
+                        h: vf.height,
+                        fps,
+                        fmt,
+                    },
+                    payload: FramePayload::Cpu { y, uv },
+                });
             }
             None
         };
@@ -110,9 +141,16 @@ pub(crate) fn spawn_worker(path: &str) -> DecodeWorkerRuntime {
                         }
                         rate = r;
                     }
-                    DecodeCmd::Seek { target_pts } => { mode = PlayState::Seeking; anchor_pts = target_pts; }
-                    DecodeCmd::Pause => { mode = PlayState::Paused; }
-                    DecodeCmd::Stop => { running = false; }
+                    DecodeCmd::Seek { target_pts } => {
+                        mode = PlayState::Seeking;
+                        anchor_pts = target_pts;
+                    }
+                    DecodeCmd::Pause => {
+                        mode = PlayState::Paused;
+                    }
+                    DecodeCmd::Stop => {
+                        running = false;
+                    }
                 }
             }
 
@@ -122,7 +160,9 @@ pub(crate) fn spawn_worker(path: &str) -> DecodeWorkerRuntime {
                     let target = anchor_pts + dt * (rate as f64);
                     if let Some(out) = attempt_decode(target) {
                         eprintln!("[WORKER] out pts={:.3}", out.pts);
-                        if let Ok(mut g) = slot_for_worker.0.lock() { *g = Some(out); }
+                        if let Ok(mut g) = slot_for_worker.0.lock() {
+                            *g = Some(out);
+                        }
                     }
                     thread::sleep(std::time::Duration::from_millis(4));
                 }
@@ -130,7 +170,9 @@ pub(crate) fn spawn_worker(path: &str) -> DecodeWorkerRuntime {
                     let target = anchor_pts;
                     if let Some(out) = attempt_decode(target) {
                         eprintln!("[WORKER] out pts={:.3}", out.pts);
-                        if let Ok(mut g) = slot_for_worker.0.lock() { *g = Some(out); }
+                        if let Ok(mut g) = slot_for_worker.0.lock() {
+                            *g = Some(out);
+                        }
                     }
                     thread::sleep(std::time::Duration::from_millis(4));
                 }
@@ -141,5 +183,9 @@ pub(crate) fn spawn_worker(path: &str) -> DecodeWorkerRuntime {
         }
     });
 
-    DecodeWorkerRuntime { handle, cmd_tx, slot }
+    DecodeWorkerRuntime {
+        handle,
+        cmd_tx,
+        slot,
+    }
 }

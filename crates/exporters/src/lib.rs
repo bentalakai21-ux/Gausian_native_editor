@@ -7,9 +7,9 @@ use thiserror::Error;
 use timeline::{Fps, Item, ItemKind, Sequence, Track};
 use uuid::Uuid;
 
-pub mod fcpxml;
-pub mod fcp7xml;
 pub mod edl;
+pub mod fcp7xml;
+pub mod fcpxml;
 
 #[derive(Debug, Error)]
 pub enum ExportError {
@@ -102,21 +102,18 @@ impl Exporter {
             ExportFormat::FcpXml1_9 | ExportFormat::FcpXml1_10 => {
                 fcpxml::export_fcpxml(sequence, assets, &self.config)
             }
-            ExportFormat::Fcp7Xml => {
-                fcp7xml::export_fcp7xml(sequence, assets, &self.config)
-            }
+            ExportFormat::Fcp7Xml => fcp7xml::export_fcp7xml(sequence, assets, &self.config),
             ExportFormat::Edl | ExportFormat::AvidEdl => {
                 edl::export_edl(sequence, assets, &self.config)
             }
-            ExportFormat::Json => {
-                self.export_json(sequence, assets)
-            }
+            ExportFormat::Json => self.export_json(sequence, assets),
         }
     }
 
     /// Import sequence from file
     pub fn import_sequence(&self, path: &Path) -> Result<(Sequence, Vec<AssetInfo>)> {
-        let extension = path.extension()
+        let extension = path
+            .extension()
             .and_then(|e| e.to_str())
             .ok_or_else(|| ExportError::UnsupportedFormat("Unknown file extension".to_string()))?;
 
@@ -135,7 +132,9 @@ impl Exporter {
             }
             "edl" => edl::import_edl(path, &self.config),
             "json" => self.import_json(path),
-            _ => Err(ExportError::UnsupportedFormat(format!("Unsupported format: {}", extension)).into()),
+            _ => Err(
+                ExportError::UnsupportedFormat(format!("Unsupported format: {}", extension)).into(),
+            ),
         }
     }
 
@@ -208,7 +207,7 @@ pub mod timecode {
 
     pub fn frames_to_timecode(frames: i64, fps: Fps, format: TimecodeFormat) -> String {
         let fps_float = fps.num as f64 / fps.den as f64;
-        
+
         match format {
             TimecodeFormat::Frames => frames.to_string(),
             TimecodeFormat::NonDropFrame => {
@@ -238,23 +237,26 @@ pub mod timecode {
 
     pub fn timecode_to_frames(timecode: &str, fps: Fps, format: TimecodeFormat) -> Result<i64> {
         match format {
-            TimecodeFormat::Frames => {
-                timecode.parse::<i64>()
-                    .map_err(|_| ExportError::InvalidTimecode(timecode.to_string()).into())
-            }
+            TimecodeFormat::Frames => timecode
+                .parse::<i64>()
+                .map_err(|_| ExportError::InvalidTimecode(timecode.to_string()).into()),
             TimecodeFormat::NonDropFrame | TimecodeFormat::DropFrame => {
                 let parts: Vec<&str> = timecode.split(&[':', ';'][..]).collect();
                 if parts.len() != 4 {
                     return Err(ExportError::InvalidTimecode(timecode.to_string()).into());
                 }
 
-                let hours: u32 = parts[0].parse()
+                let hours: u32 = parts[0]
+                    .parse()
                     .map_err(|_| ExportError::InvalidTimecode(timecode.to_string()))?;
-                let minutes: u32 = parts[1].parse()
+                let minutes: u32 = parts[1]
+                    .parse()
                     .map_err(|_| ExportError::InvalidTimecode(timecode.to_string()))?;
-                let seconds: u32 = parts[2].parse()
+                let seconds: u32 = parts[2]
+                    .parse()
                     .map_err(|_| ExportError::InvalidTimecode(timecode.to_string()))?;
-                let frame: u32 = parts[3].parse()
+                let frame: u32 = parts[3]
+                    .parse()
                     .map_err(|_| ExportError::InvalidTimecode(timecode.to_string()))?;
 
                 let fps_float = fps.num as f64 / fps.den as f64;
@@ -298,12 +300,16 @@ pub mod relinking {
             asset.path = rel_path.clone();
             Ok(RelinkResult::Relinked(rel_path.clone()))
         } else {
-            Ok(RelinkResult::Failed("No relative path available".to_string()))
+            Ok(RelinkResult::Failed(
+                "No relative path available".to_string(),
+            ))
         }
     }
 
     fn relink_heuristic(asset: &mut AssetInfo, search_paths: &[PathBuf]) -> Result<RelinkResult> {
-        let filename = asset.path.file_name()
+        let filename = asset
+            .path
+            .file_name()
             .ok_or_else(|| ExportError::RelinkingFailed("Invalid asset path".to_string()))?;
 
         // First try exact filename match
@@ -311,7 +317,7 @@ pub mod relinking {
             for entry in WalkDir::new(search_path).into_iter().filter_map(|e| e.ok()) {
                 if entry.file_name() == filename {
                     let new_path = entry.path().to_path_buf();
-                    
+
                     // Verify it's the same file if we have a hash
                     if let Some(expected_hash) = &asset.hash {
                         if let Ok(actual_hash) = calculate_file_hash(&new_path) {
@@ -337,7 +343,7 @@ pub mod relinking {
         let mut file = std::fs::File::open(path)?;
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
         let mut buffer = [0; 8192];
-        
+
         loop {
             match file.read(&mut buffer)? {
                 0 => break,
@@ -347,7 +353,7 @@ pub mod relinking {
                 }
             }
         }
-        
+
         use std::hash::Hasher;
         Ok(format!("{:x}", hasher.finish()))
     }
@@ -391,9 +397,17 @@ impl<'de> Deserialize<'de> for ExportFormat {
             "edl" => Ok(ExportFormat::Edl),
             "avid_edl" => Ok(ExportFormat::AvidEdl),
             "json" => Ok(ExportFormat::Json),
-            _ => Err(serde::de::Error::unknown_variant(&s, &[
-                "fcpxml_1_9", "fcpxml_1_10", "fcp7xml", "edl", "avid_edl", "json"
-            ])),
+            _ => Err(serde::de::Error::unknown_variant(
+                &s,
+                &[
+                    "fcpxml_1_9",
+                    "fcpxml_1_10",
+                    "fcp7xml",
+                    "edl",
+                    "avid_edl",
+                    "json",
+                ],
+            )),
         }
     }
 }

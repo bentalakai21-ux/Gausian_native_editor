@@ -23,7 +23,12 @@ pub fn decode_audio_to_buffer(path: &Path) -> Result<AudioBuffer> {
     }
 
     let probed = symphonia::default::get_probe()
-        .format(&hint, mss, &FormatOptions::default(), &MetadataOptions::default())
+        .format(
+            &hint,
+            mss,
+            &FormatOptions::default(),
+            &MetadataOptions::default(),
+        )
         .map_err(|e| anyhow!(e))?;
     let mut format = probed.format;
 
@@ -48,13 +53,16 @@ pub fn decode_audio_to_buffer(path: &Path) -> Result<AudioBuffer> {
     loop {
         match format.next_packet() {
             Ok(packet) => {
-                if packet.track_id() != track_id { continue; }
+                if packet.track_id() != track_id {
+                    continue;
+                }
                 let decoded = match decoder.decode(&packet) {
                     Ok(buf) => buf,
                     Err(Error::DecodeError(_)) => continue,
                     Err(err) => return Err(anyhow!(err)),
                 };
-                let mut sample_buf = SampleBuffer::<f32>::new(decoded.capacity() as u64, *decoded.spec());
+                let mut sample_buf =
+                    SampleBuffer::<f32>::new(decoded.capacity() as u64, *decoded.spec());
                 sample_buf.copy_interleaved_ref(decoded);
                 samples.extend_from_slice(sample_buf.samples());
             }

@@ -1,14 +1,21 @@
 use anyhow::{anyhow, Context, Result};
 use crossbeam_channel::{unbounded, Receiver, Sender};
 use parking_lot::Mutex;
-use std::collections::{HashSet, VecDeque};
 use serde::{Deserialize, Serialize};
-use std::{fs, io::Write, path::{Path, PathBuf}, sync::Arc, thread, time::Duration};
+use std::collections::{HashSet, VecDeque};
+use std::{
+    fs,
+    io::Write,
+    path::{Path, PathBuf},
+    sync::Arc,
+    thread,
+    time::Duration,
+};
 use thiserror::Error;
 use uuid::Uuid;
 
-use project::{app_data_dir, JobRow, ProjectDb};
 use media_io::{generate_proxy, generate_thumbnail, generate_waveform};
+use project::{app_data_dir, JobRow, ProjectDb};
 
 #[derive(Debug, Error)]
 pub enum JobError {
@@ -90,7 +97,15 @@ impl JobsRuntime {
             }
         }
 
-        let runtime = JobsRuntime { _queue: queue.clone(), rx_submit, rx_cancel, tx_events: tx_events.clone(), _workers: Vec::new(), canceled: canceled.clone(), _db_path: db_path_arc.clone() };
+        let runtime = JobsRuntime {
+            _queue: queue.clone(),
+            rx_submit,
+            rx_cancel,
+            tx_events: tx_events.clone(),
+            _workers: Vec::new(),
+            canceled: canceled.clone(),
+            _db_path: db_path_arc.clone(),
+        };
         runtime.spawn_workers(num_workers, queue.clone(), db_path_arc.clone());
 
         // Feeder thread
@@ -100,31 +115,38 @@ impl JobsRuntime {
             let rx_s = runtime.rx_submit.clone();
             let rx_c = runtime.rx_cancel.clone();
             let tx_e = runtime.tx_events.clone();
-            thread::spawn(move || {
-                loop {
-                    crossbeam_channel::select! {
-                        recv(rx_s) -> msg => {
-                            if let Ok((id, spec)) = msg {
-                                if canceled.lock().contains(&id) { continue; }
-                                q.lock().push_back((id.clone(), spec.clone()));
-                                let _ = tx_e.send(JobEvent { id, asset_id: spec.asset_id.clone(), kind: spec.kind, status: JobStatus::Pending });
-                            }
-                            else { break; }
+            thread::spawn(move || loop {
+                crossbeam_channel::select! {
+                    recv(rx_s) -> msg => {
+                        if let Ok((id, spec)) = msg {
+                            if canceled.lock().contains(&id) { continue; }
+                            q.lock().push_back((id.clone(), spec.clone()));
+                            let _ = tx_e.send(JobEvent { id, asset_id: spec.asset_id.clone(), kind: spec.kind, status: JobStatus::Pending });
                         }
-                        recv(rx_c) -> msg => {
-                            if let Ok(id) = msg { canceled.lock().insert(id); }
-                            else { break; }
-                        }
-                        default(Duration::from_millis(10)) => {}
+                        else { break; }
                     }
+                    recv(rx_c) -> msg => {
+                        if let Ok(id) = msg { canceled.lock().insert(id); }
+                        else { break; }
+                    }
+                    default(Duration::from_millis(10)) => {}
                 }
             });
         }
 
-        JobsHandle { tx_submit, tx_cancel, rx_events }
+        JobsHandle {
+            tx_submit,
+            tx_cancel,
+            rx_events,
+        }
     }
 
-    fn spawn_workers(&self, n: usize, queue: Arc<Mutex<VecDeque<(String, JobSpec)>>>, db_path: Arc<PathBuf>) {
+    fn spawn_workers(
+        &self,
+        n: usize,
+        queue: Arc<Mutex<VecDeque<(String, JobSpec)>>>,
+        db_path: Arc<PathBuf>,
+    ) {
         for _ in 0..n {
             let q = queue.clone();
             let tx_e = self.tx_events.clone();
@@ -145,27 +167,50 @@ impl JobsRuntime {
                         let mut ql = q.lock();
                         let mut found: Option<(String, JobSpec)> = None;
                         while let Some((id, spec)) = ql.pop_front() {
-                            if !canceled.lock().contains(&id) { found = Some((id, spec)); break; }
+                            if !canceled.lock().contains(&id) {
+                                found = Some((id, spec));
+                                break;
+                            }
                         }
                         found
                     };
                     if let Some((id, spec)) = job_opt {
                         if canceled.lock().contains(&id) {
-                            let _ = tx_e.send(JobEvent { id, asset_id: spec.asset_id.clone(), kind: spec.kind, status: JobStatus::Canceled });
+                            let _ = tx_e.send(JobEvent {
+                                id,
+                                asset_id: spec.asset_id.clone(),
+                                kind: spec.kind,
+                                status: JobStatus::Canceled,
+                            });
                             continue;
                         }
-                        let _ = tx_e.send(JobEvent { id: id.clone(), asset_id: spec.asset_id.clone(), kind: spec.kind, status: JobStatus::Running });
+                        let _ = tx_e.send(JobEvent {
+                            id: id.clone(),
+                            asset_id: spec.asset_id.clone(),
+                            kind: spec.kind,
+                            status: JobStatus::Running,
+                        });
                         let _ = db.update_job_status(&id, "running");
 
-                    let result = execute_job(&db, &spec);
+                        let result = execute_job(&db, &spec);
                         match result {
                             Ok(_) => {
                                 let _ = db.update_job_status(&id, "done");
-                                let _ = tx_e.send(JobEvent { id, asset_id: spec.asset_id, kind: spec.kind, status: JobStatus::Done });
+                                let _ = tx_e.send(JobEvent {
+                                    id,
+                                    asset_id: spec.asset_id,
+                                    kind: spec.kind,
+                                    status: JobStatus::Done,
+                                });
                             }
                             Err(e) => {
                                 let _ = db.update_job_status(&id, "failed");
-                                let _ = tx_e.send(JobEvent { id, asset_id: spec.asset_id, kind: spec.kind, status: JobStatus::Failed(e.to_string()) });
+                                let _ = tx_e.send(JobEvent {
+                                    id,
+                                    asset_id: spec.asset_id,
+                                    kind: spec.kind,
+                                    status: JobStatus::Failed(e.to_string()),
+                                });
                             }
                         }
                     } else {
@@ -195,7 +240,11 @@ impl JobsHandle {
 
 fn job_spec_from_row(row: &JobRow) -> Option<JobSpec> {
     let kind = parse_job_kind(&row.kind)?;
-    Some(JobSpec { asset_id: row.asset_id.clone(), kind, priority: row.priority })
+    Some(JobSpec {
+        asset_id: row.asset_id.clone(),
+        kind,
+        priority: row.priority,
+    })
 }
 
 fn parse_job_kind(kind: &str) -> Option<JobKind> {
@@ -227,7 +276,9 @@ fn execute_job(db: &ProjectDb, spec: &JobSpec) -> Result<()> {
             db.update_asset_analysis(&asset.id, Some(out.as_path()), None, None, None)?;
         }
         JobKind::Thumbnails => {
-            if !asset.kind.eq_ignore_ascii_case("video") && !asset.kind.eq_ignore_ascii_case("image") {
+            if !asset.kind.eq_ignore_ascii_case("video")
+                && !asset.kind.eq_ignore_ascii_case("image")
+            {
                 return Err(anyhow!("thumbnail job requires video or image asset"));
             }
             let thumb_dir = cache_root.join("thumbnails");
@@ -235,7 +286,8 @@ fn execute_job(db: &ProjectDb, spec: &JobSpec) -> Result<()> {
             let out = thumb_dir.join(format!("{}-thumb.jpg", asset.id));
             let (width, height) = choose_thumb_dimensions(&asset);
             let capture_sec = choose_capture_time(&asset);
-            generate_thumbnail(source_path, &out, capture_sec, width, height).context("generate thumbnail")?;
+            generate_thumbnail(source_path, &out, capture_sec, width, height)
+                .context("generate thumbnail")?;
             db.update_asset_analysis(&asset.id, None, Some(out.as_path()), None, None)?;
         }
         JobKind::Proxy => {

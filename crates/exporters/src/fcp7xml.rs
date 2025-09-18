@@ -4,7 +4,11 @@ use std::path::Path;
 use timeline::Sequence;
 
 /// Export sequence to Final Cut Pro 7 XML format
-pub fn export_fcp7xml(sequence: &Sequence, assets: &[AssetInfo], config: &ExportConfig) -> Result<()> {
+pub fn export_fcp7xml(
+    sequence: &Sequence,
+    assets: &[AssetInfo],
+    config: &ExportConfig,
+) -> Result<()> {
     // Simplified FCP7 XML export
     let xml_content = generate_fcp7_xml(sequence, assets, config)?;
     std::fs::write(&config.output_path, xml_content)?;
@@ -14,16 +18,27 @@ pub fn export_fcp7xml(sequence: &Sequence, assets: &[AssetInfo], config: &Export
 /// Import sequence from Final Cut Pro 7 XML file
 pub fn import_fcp7xml(path: &Path, config: &ExportConfig) -> Result<(Sequence, Vec<AssetInfo>)> {
     let _content = std::fs::read_to_string(path)?;
-    
+
     // Simplified import - return empty sequence for now
-    let sequence = Sequence::new("Imported FCP7 Sequence", 1920, 1080, timeline::Fps::new(30, 1), 0);
+    let sequence = Sequence::new(
+        "Imported FCP7 Sequence",
+        1920,
+        1080,
+        timeline::Fps::new(30, 1),
+        0,
+    );
     let assets = Vec::new();
-    
+
     Ok((sequence, assets))
 }
 
-fn generate_fcp7_xml(sequence: &Sequence, _assets: &[AssetInfo], config: &ExportConfig) -> Result<String> {
-    let xml = format!(r#"<?xml version="1.0" encoding="UTF-8"?>
+fn generate_fcp7_xml(
+    sequence: &Sequence,
+    _assets: &[AssetInfo],
+    config: &ExportConfig,
+) -> Result<String> {
+    let xml = format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE xmeml>
 <xmeml version="5">
     <project>
@@ -92,6 +107,6 @@ fn generate_fcp7_xml(sequence: &Sequence, _assets: &[AssetInfo], config: &Export
         sequence.height,
         config.audio_sample_rate
     );
-    
+
     Ok(xml)
 }

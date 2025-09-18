@@ -30,17 +30,17 @@ pub struct Renderer {
     pub queue: wgpu::Queue,
     surface: Option<wgpu::Surface<'static>>,
     surface_config: Option<wgpu::SurfaceConfiguration>,
-    
+
     // Render pipelines
     yuv_to_rgb_pipeline: Option<wgpu::RenderPipeline>,
     scale_pipeline: Option<wgpu::RenderPipeline>,
     blend_pipeline: Option<wgpu::RenderPipeline>,
     transform_pipeline: Option<wgpu::RenderPipeline>,
-    
+
     // Bind group layouts
     texture_bind_group_layout: wgpu::BindGroupLayout,
     uniform_bind_group_layout: wgpu::BindGroupLayout,
-    
+
     // Vertex buffer for full-screen quad
     vertex_buffer: wgpu::Buffer,
     index_buffer: wgpu::Buffer,
@@ -54,10 +54,22 @@ struct Vertex {
 }
 
 const VERTICES: &[Vertex] = &[
-    Vertex { position: [-1.0, -1.0], tex_coords: [0.0, 1.0] },
-    Vertex { position: [1.0, -1.0], tex_coords: [1.0, 1.0] },
-    Vertex { position: [1.0, 1.0], tex_coords: [1.0, 0.0] },
-    Vertex { position: [-1.0, 1.0], tex_coords: [0.0, 0.0] },
+    Vertex {
+        position: [-1.0, -1.0],
+        tex_coords: [0.0, 1.0],
+    },
+    Vertex {
+        position: [1.0, -1.0],
+        tex_coords: [1.0, 1.0],
+    },
+    Vertex {
+        position: [1.0, 1.0],
+        tex_coords: [1.0, 0.0],
+    },
+    Vertex {
+        position: [-1.0, 1.0],
+        tex_coords: [0.0, 0.0],
+    },
 ];
 
 const INDICES: &[u16] = &[0, 1, 2, 2, 3, 0];
@@ -111,7 +123,7 @@ pub enum ColorSpace {
 impl Renderer {
     pub async fn new(surface: Option<wgpu::Surface<'static>>) -> Result<Self> {
         let instance = wgpu::Instance::default();
-        
+
         let adapter = instance
             .request_adapter(&wgpu::RequestAdapterOptions {
                 power_preference: wgpu::PowerPreference::HighPerformance,
@@ -133,31 +145,32 @@ impl Renderer {
             .await?;
 
         // Create bind group layouts
-        let texture_bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            entries: &[
-                wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Texture {
-                        multisampled: false,
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+        let texture_bind_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            multisampled: false,
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        },
+                        count: None,
                     },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 1,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-                    count: None,
-                },
-            ],
-            label: Some("texture_bind_group_layout"),
-        });
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                        count: None,
+                    },
+                ],
+                label: Some("texture_bind_group_layout"),
+            });
 
-        let uniform_bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            entries: &[
-                wgpu::BindGroupLayoutEntry {
+        let uniform_bind_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                entries: &[wgpu::BindGroupLayoutEntry {
                     binding: 0,
                     visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
                     ty: wgpu::BindingType::Buffer {
@@ -166,10 +179,9 @@ impl Renderer {
                         min_binding_size: None,
                     },
                     count: None,
-                },
-            ],
-            label: Some("uniform_bind_group_layout"),
-        });
+                }],
+                label: Some("uniform_bind_group_layout"),
+            });
 
         // Create vertex and index buffers
         let vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -200,11 +212,16 @@ impl Renderer {
         };
 
         // We'll initialize pipelines later when surface is configured
-        
+
         Ok(renderer)
     }
 
-    pub fn configure_surface(&mut self, width: u32, height: u32, adapter: &wgpu::Adapter) -> Result<()> {
+    pub fn configure_surface(
+        &mut self,
+        width: u32,
+        height: u32,
+        adapter: &wgpu::Adapter,
+    ) -> Result<()> {
         if let Some(surface) = &self.surface {
             let capabilities = surface.get_capabilities(adapter);
             let config = wgpu::SurfaceConfiguration {
@@ -217,7 +234,7 @@ impl Renderer {
                 view_formats: vec![],
                 desired_maximum_frame_latency: 2,
             };
-            
+
             surface.configure(&self.device, &config);
             self.surface_config = Some(config.clone());
             self.init_pipelines(config.format)?;
@@ -227,29 +244,40 @@ impl Renderer {
 
     fn init_pipelines(&mut self, surface_format: wgpu::TextureFormat) -> Result<()> {
         // YUV to RGB conversion shader
-        let yuv_shader = self.device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("YUV to RGB Shader"),
-            source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(include_str!("shaders/yuv_to_rgb.wgsl"))),
-        });
+        let yuv_shader = self
+            .device
+            .create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("YUV to RGB Shader"),
+                source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(include_str!(
+                    "shaders/yuv_to_rgb.wgsl"
+                ))),
+            });
 
         // Scale shader
-        let scale_shader = self.device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("Scale Shader"),
-            source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(include_str!("shaders/scale.wgsl"))),
-        });
+        let scale_shader = self
+            .device
+            .create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("Scale Shader"),
+                source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(include_str!("shaders/scale.wgsl"))),
+            });
 
         // Blend shader
-        let blend_shader = self.device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("Blend Shader"),
-            source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(include_str!("shaders/blend.wgsl"))),
-        });
+        let blend_shader = self
+            .device
+            .create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("Blend Shader"),
+                source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(include_str!("shaders/blend.wgsl"))),
+            });
 
         // Transform shader
-        let transform_shader = self.device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("Transform Shader"),
-            source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(include_str!("shaders/transform.wgsl"))),
-        });
-
+        let transform_shader = self
+            .device
+            .create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("Transform Shader"),
+                source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(include_str!(
+                    "shaders/transform.wgsl"
+                ))),
+            });
 
         // Create render pipelines
         self.yuv_to_rgb_pipeline = Some(self.create_render_pipeline(
@@ -258,17 +286,11 @@ impl Renderer {
             surface_format,
         )?);
 
-        self.scale_pipeline = Some(self.create_render_pipeline(
-            "Scale Pipeline",
-            &scale_shader,
-            surface_format,
-        )?);
+        self.scale_pipeline =
+            Some(self.create_render_pipeline("Scale Pipeline", &scale_shader, surface_format)?);
 
-        self.blend_pipeline = Some(self.create_render_pipeline(
-            "Blend Pipeline",
-            &blend_shader,
-            surface_format,
-        )?);
+        self.blend_pipeline =
+            Some(self.create_render_pipeline("Blend Pipeline", &blend_shader, surface_format)?);
 
         self.transform_pipeline = Some(self.create_render_pipeline(
             "Transform Pipeline",
@@ -285,63 +307,70 @@ impl Renderer {
         shader: &wgpu::ShaderModule,
         surface_format: wgpu::TextureFormat,
     ) -> Result<wgpu::RenderPipeline> {
-        let render_pipeline_layout = self.device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some(&format!("{} Layout", label)),
-            bind_group_layouts: &[&self.texture_bind_group_layout, &self.uniform_bind_group_layout],
-            push_constant_ranges: &[],
-        });
-
-        let render_pipeline = self.device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some(label),
-            layout: Some(&render_pipeline_layout),
-            vertex: wgpu::VertexState {
-                module: shader,
-                entry_point: "vs_main",
-                compilation_options: wgpu::PipelineCompilationOptions::default(),
-                buffers: &[wgpu::VertexBufferLayout {
-                    array_stride: std::mem::size_of::<Vertex>() as wgpu::BufferAddress,
-                    step_mode: wgpu::VertexStepMode::Vertex,
-                    attributes: &[
-                        wgpu::VertexAttribute {
-                            offset: 0,
-                            shader_location: 0,
-                            format: wgpu::VertexFormat::Float32x2,
-                        },
-                        wgpu::VertexAttribute {
-                            offset: std::mem::size_of::<[f32; 2]>() as wgpu::BufferAddress,
-                            shader_location: 1,
-                            format: wgpu::VertexFormat::Float32x2,
-                        },
+        let render_pipeline_layout =
+            self.device
+                .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                    label: Some(&format!("{} Layout", label)),
+                    bind_group_layouts: &[
+                        &self.texture_bind_group_layout,
+                        &self.uniform_bind_group_layout,
                     ],
-                }],
-            },
-            fragment: Some(wgpu::FragmentState {
-                module: shader,
-                entry_point: "fs_main",
-                compilation_options: wgpu::PipelineCompilationOptions::default(),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format: surface_format,
-                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-            }),
-            primitive: wgpu::PrimitiveState {
-                topology: wgpu::PrimitiveTopology::TriangleList,
-                strip_index_format: None,
-                front_face: wgpu::FrontFace::Ccw,
-                cull_mode: Some(wgpu::Face::Back),
-                polygon_mode: wgpu::PolygonMode::Fill,
-                unclipped_depth: false,
-                conservative: false,
-            },
-            depth_stencil: None,
-            multisample: wgpu::MultisampleState {
-                count: 1,
-                mask: !0,
-                alpha_to_coverage_enabled: false,
-            },
-            multiview: None,
-        });
+                    push_constant_ranges: &[],
+                });
+
+        let render_pipeline = self
+            .device
+            .create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some(label),
+                layout: Some(&render_pipeline_layout),
+                vertex: wgpu::VertexState {
+                    module: shader,
+                    entry_point: "vs_main",
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                    buffers: &[wgpu::VertexBufferLayout {
+                        array_stride: std::mem::size_of::<Vertex>() as wgpu::BufferAddress,
+                        step_mode: wgpu::VertexStepMode::Vertex,
+                        attributes: &[
+                            wgpu::VertexAttribute {
+                                offset: 0,
+                                shader_location: 0,
+                                format: wgpu::VertexFormat::Float32x2,
+                            },
+                            wgpu::VertexAttribute {
+                                offset: std::mem::size_of::<[f32; 2]>() as wgpu::BufferAddress,
+                                shader_location: 1,
+                                format: wgpu::VertexFormat::Float32x2,
+                            },
+                        ],
+                    }],
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: shader,
+                    entry_point: "fs_main",
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: surface_format,
+                        blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                }),
+                primitive: wgpu::PrimitiveState {
+                    topology: wgpu::PrimitiveTopology::TriangleList,
+                    strip_index_format: None,
+                    front_face: wgpu::FrontFace::Ccw,
+                    cull_mode: Some(wgpu::Face::Back),
+                    polygon_mode: wgpu::PolygonMode::Fill,
+                    unclipped_depth: false,
+                    conservative: false,
+                },
+                depth_stencil: None,
+                multisample: wgpu::MultisampleState {
+                    count: 1,
+                    mask: !0,
+                    alpha_to_coverage_enabled: false,
+                },
+                multiview: None,
+            });
 
         Ok(render_pipeline)
     }
@@ -355,9 +384,11 @@ impl Renderer {
         output: &wgpu::TextureView,
         color_space: ColorSpace,
     ) -> Result<()> {
-        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("YUV to RGB Encoder"),
-        });
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("YUV to RGB Encoder"),
+            });
 
         // Create bind groups for YUV textures
         let sampler = self.device.create_sampler(&wgpu::SamplerDescriptor {
@@ -375,7 +406,9 @@ impl Renderer {
             entries: &[
                 wgpu::BindGroupEntry {
                     binding: 0,
-                    resource: wgpu::BindingResource::TextureView(&y_texture.create_view(&wgpu::TextureViewDescriptor::default())),
+                    resource: wgpu::BindingResource::TextureView(
+                        &y_texture.create_view(&wgpu::TextureViewDescriptor::default()),
+                    ),
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
@@ -387,20 +420,20 @@ impl Renderer {
 
         // Create color conversion uniforms based on color space
         let color_uniforms = self.create_color_conversion_uniforms(color_space);
-        let uniform_buffer = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("Color Uniforms Buffer"),
-            contents: bytemuck::cast_slice(&[color_uniforms]),
-            usage: wgpu::BufferUsages::UNIFORM,
-        });
+        let uniform_buffer = self
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("Color Uniforms Buffer"),
+                contents: bytemuck::cast_slice(&[color_uniforms]),
+                usage: wgpu::BufferUsages::UNIFORM,
+            });
 
         let uniform_bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             layout: &self.uniform_bind_group_layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: uniform_buffer.as_entire_binding(),
-                },
-            ],
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: uniform_buffer.as_entire_binding(),
+            }],
             label: Some("Uniform Bind Group"),
         });
 
@@ -425,7 +458,8 @@ impl Renderer {
                 render_pass.set_bind_group(0, &y_bind_group, &[]);
                 render_pass.set_bind_group(1, &uniform_bind_group, &[]);
                 render_pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
-                render_pass.set_index_buffer(self.index_buffer.slice(..), wgpu::IndexFormat::Uint16);
+                render_pass
+                    .set_index_buffer(self.index_buffer.slice(..), wgpu::IndexFormat::Uint16);
                 render_pass.draw_indexed(0..INDICES.len() as u32, 0, 0..1);
             }
         }
@@ -442,9 +476,11 @@ impl Renderer {
         scale_factor: f32,
         filter_mode: FilterMode,
     ) -> Result<()> {
-        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("Scale Encoder"),
-        });
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("Scale Encoder"),
+            });
 
         let sampler = self.device.create_sampler(&wgpu::SamplerDescriptor {
             mag_filter: match filter_mode {
@@ -493,7 +529,8 @@ impl Renderer {
                 render_pass.set_pipeline(pipeline);
                 render_pass.set_bind_group(0, &texture_bind_group, &[]);
                 render_pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
-                render_pass.set_index_buffer(self.index_buffer.slice(..), wgpu::IndexFormat::Uint16);
+                render_pass
+                    .set_index_buffer(self.index_buffer.slice(..), wgpu::IndexFormat::Uint16);
                 render_pass.draw_indexed(0..INDICES.len() as u32, 0, 0..1);
             }
         }
@@ -572,10 +609,19 @@ impl Renderer {
     }
 
     /// Create texture from raw RGBA data
-    pub fn create_texture_from_rgba(&self, width: u32, height: u32, data: &[u8]) -> Result<wgpu::Texture> {
+    pub fn create_texture_from_rgba(
+        &self,
+        width: u32,
+        height: u32,
+        data: &[u8],
+    ) -> Result<wgpu::Texture> {
         let texture = self.device.create_texture(&wgpu::TextureDescriptor {
             label: Some("RGBA Texture"),
-            size: wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+            size: wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
@@ -597,17 +643,30 @@ impl Renderer {
                 bytes_per_row: Some(4 * width),
                 rows_per_image: Some(height),
             },
-            wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+            wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
         );
 
         Ok(texture)
     }
 
     /// Render to texture and read back to CPU
-    pub async fn render_to_cpu(&self, width: u32, height: u32, render_fn: impl FnOnce(&mut wgpu::RenderPass)) -> Result<Vec<u8>> {
+    pub async fn render_to_cpu(
+        &self,
+        width: u32,
+        height: u32,
+        render_fn: impl FnOnce(&mut wgpu::RenderPass),
+    ) -> Result<Vec<u8>> {
         let texture = self.device.create_texture(&wgpu::TextureDescriptor {
             label: Some("Render Target"),
-            size: wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+            size: wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
@@ -617,9 +676,11 @@ impl Renderer {
         });
 
         let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
-        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("Render to CPU Encoder"),
-        });
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("Render to CPU Encoder"),
+            });
 
         {
             let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -663,7 +724,11 @@ impl Renderer {
                     rows_per_image: Some(height),
                 },
             },
-            wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+            wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
         );
 
         self.queue.submit(std::iter::once(encoder.finish()));
@@ -674,9 +739,11 @@ impl Renderer {
         buffer_slice.map_async(wgpu::MapMode::Read, move |result| {
             tx.send(result).unwrap();
         });
-        
+
         self.device.poll(wgpu::Maintain::Wait);
-        rx.recv().unwrap().map_err(|_| anyhow::anyhow!("Buffer async error"))?;
+        rx.recv()
+            .unwrap()
+            .map_err(|_| anyhow::anyhow!("Buffer async error"))?;
 
         let data = buffer_slice.get_mapped_range().to_vec();
         buffer.unmap();

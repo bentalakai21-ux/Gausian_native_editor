@@ -1,7 +1,11 @@
 use timeline::{NodeId, TimelineNode, TrackId};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum DragMode { Move, TrimStart, TrimEnd }
+pub enum DragMode {
+    Move,
+    TrimStart,
+    TrimEnd,
+}
 
 #[derive(Clone, Debug)]
 pub struct DragState {

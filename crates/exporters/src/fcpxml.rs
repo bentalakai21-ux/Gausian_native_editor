@@ -1,6 +1,6 @@
 use crate::{AssetInfo, ColorSpace, ExportConfig, ExportError, TimecodeFormat};
 use anyhow::Result;
-use quick_xml::events::{Event, BytesEnd, BytesStart, BytesText};
+use quick_xml::events::{BytesEnd, BytesStart, BytesText, Event};
 use quick_xml::{Reader, Writer};
 use serde::{Deserialize, Serialize};
 use std::io::Cursor;
@@ -9,7 +9,11 @@ use timeline::{Fps, Item, ItemKind, Sequence, Track};
 use uuid::Uuid;
 
 /// Export sequence to FCPXML format
-pub fn export_fcpxml(sequence: &Sequence, assets: &[AssetInfo], config: &ExportConfig) -> Result<()> {
+pub fn export_fcpxml(
+    sequence: &Sequence,
+    assets: &[AssetInfo],
+    config: &ExportConfig,
+) -> Result<()> {
     let fcpxml = FcpXml::from_sequence(sequence, assets, config)?;
     let xml_content = fcpxml.to_xml()?;
     std::fs::write(&config.output_path, xml_content)?;
@@ -119,15 +123,22 @@ struct FcpMedia {
 }
 
 impl FcpXml {
-    fn from_sequence(sequence: &Sequence, assets: &[AssetInfo], config: &ExportConfig) -> Result<Self> {
+    fn from_sequence(
+        sequence: &Sequence,
+        assets: &[AssetInfo],
+        config: &ExportConfig,
+    ) -> Result<Self> {
         let project_uid = Uuid::new_v4().to_string();
         let sequence_uid = Uuid::new_v4().to_string();
         let event_uid = Uuid::new_v4().to_string();
 
         // Convert frame duration to rational string
         let frame_duration = format!("{}s", sequence.fps.den as f64 / sequence.fps.num as f64);
-        let total_duration = format!("{}s", 
-            (sequence.duration_in_frames * sequence.fps.den as i64) as f64 / sequence.fps.num as f64);
+        let total_duration = format!(
+            "{}s",
+            (sequence.duration_in_frames * sequence.fps.den as i64) as f64
+                / sequence.fps.num as f64
+        );
 
         // Create format
         let format = FcpFormat {
@@ -154,27 +165,33 @@ impl FcpXml {
                 let asset_uid = Uuid::new_v4().to_string();
 
                 // Find matching asset info
-                let asset_info = assets.iter().find(|a| {
-                    match &item.kind {
-                        ItemKind::Video { src, .. } | ItemKind::Audio { src, .. } | ItemKind::Image { src } => {
-                            a.path.to_string_lossy() == *src
-                        }
-                        _ => false,
-                    }
+                let asset_info = assets.iter().find(|a| match &item.kind {
+                    ItemKind::Video { src, .. }
+                    | ItemKind::Audio { src, .. }
+                    | ItemKind::Image { src } => a.path.to_string_lossy() == *src,
+                    _ => false,
                 });
 
-                let clip_duration = format!("{}s", 
-                    (item.duration_in_frames * sequence.fps.den as i64) as f64 / sequence.fps.num as f64);
-                let clip_start = format!("{}s", 
-                    (item.from * sequence.fps.den as i64) as f64 / sequence.fps.num as f64);
+                let clip_duration = format!(
+                    "{}s",
+                    (item.duration_in_frames * sequence.fps.den as i64) as f64
+                        / sequence.fps.num as f64
+                );
+                let clip_start = format!(
+                    "{}s",
+                    (item.from * sequence.fps.den as i64) as f64 / sequence.fps.num as f64
+                );
 
                 match &item.kind {
-                    ItemKind::Video { src, frame_rate: _, .. } => {
-                        let asset_name = Path::new(src).file_stem()
+                    ItemKind::Video {
+                        src, frame_rate: _, ..
+                    } => {
+                        let asset_name = Path::new(src)
+                            .file_stem()
                             .and_then(|s| s.to_str())
                             .unwrap_or("Unknown")
                             .to_string();
-                        
+
                         let asset = FcpAsset {
                             id: asset_uid.clone(),
                             name: asset_name.clone(),
@@ -190,24 +207,25 @@ impl FcpXml {
                         };
                         fcp_assets.push(asset);
 
-                    let clip = FcpClip {
-                        name: asset_name,
-                        uid: clip_uid,
-                        duration: clip_duration,
-                        start: clip_start,
-                        offset: "0s".to_string(),
-                        ref_id: asset_uid,
-                        format: Some("r1".to_string()),
-                        audio_subitems: Vec::new(),
-                    };
-                    clips.push(clip);
-                }
+                        let clip = FcpClip {
+                            name: asset_name,
+                            uid: clip_uid,
+                            duration: clip_duration,
+                            start: clip_start,
+                            offset: "0s".to_string(),
+                            ref_id: asset_uid,
+                            format: Some("r1".to_string()),
+                            audio_subitems: Vec::new(),
+                        };
+                        clips.push(clip);
+                    }
                     ItemKind::Image { src } => {
-                        let asset_name = Path::new(src).file_stem()
+                        let asset_name = Path::new(src)
+                            .file_stem()
                             .and_then(|s| s.to_str())
                             .unwrap_or("Unknown")
                             .to_string();
-                        
+
                         let asset = FcpAsset {
                             id: asset_uid.clone(),
                             name: asset_name.clone(),
@@ -236,11 +254,12 @@ impl FcpXml {
                         clips.push(clip);
                     }
                     ItemKind::Audio { src, .. } => {
-                        let asset_name = Path::new(src).file_stem()
+                        let asset_name = Path::new(src)
+                            .file_stem()
                             .and_then(|s| s.to_str())
                             .unwrap_or("Unknown")
                             .to_string();
-                        
+
                         let asset = FcpAsset {
                             id: asset_uid.clone(),
                             name: asset_name.clone(),
@@ -320,7 +339,11 @@ impl FcpXml {
         let mut writer = Writer::new(Cursor::new(&mut buffer));
 
         // Write XML declaration
-        writer.write_event(Event::Decl(quick_xml::events::BytesDecl::new("1.0", Some("UTF-8"), None)))?;
+        writer.write_event(Event::Decl(quick_xml::events::BytesDecl::new(
+            "1.0",
+            Some("UTF-8"),
+            None,
+        )))?;
 
         // Write root fcpxml element
         let mut fcpxml_elem = BytesStart::new("fcpxml");
@@ -349,7 +372,7 @@ impl FcpXml {
 
     fn write_sequence(&self, writer: &mut Writer<Cursor<&mut Vec<u8>>>) -> Result<()> {
         let seq = &self.project.sequence;
-        
+
         let mut seq_elem = BytesStart::new("sequence");
         seq_elem.push_attribute(("name", seq.name.as_str()));
         seq_elem.push_attribute(("uid", seq.uid.as_str()));
@@ -359,14 +382,14 @@ impl FcpXml {
 
         // Write spine
         writer.write_event(Event::Start(BytesStart::new("spine")))?;
-        
+
         for clip in &seq.spine.clips {
             self.write_clip(writer, clip)?;
         }
-        
+
         writer.write_event(Event::End(BytesEnd::new("spine")))?;
         writer.write_event(Event::End(BytesEnd::new("sequence")))?;
-        
+
         Ok(())
     }
 
@@ -378,18 +401,22 @@ impl FcpXml {
         clip_elem.push_attribute(("start", clip.start.as_str()));
         clip_elem.push_attribute(("offset", clip.offset.as_str()));
         clip_elem.push_attribute(("ref", clip.ref_id.as_str()));
-        
+
         if let Some(format) = &clip.format {
             clip_elem.push_attribute(("format", format.as_str()));
         }
-        
+
         writer.write_event(Event::Start(clip_elem))?;
         writer.write_event(Event::End(BytesEnd::new("clip")))?;
-        
+
         Ok(())
     }
 
-    fn write_event(&self, writer: &mut Writer<Cursor<&mut Vec<u8>>>, event: &FcpEvent) -> Result<()> {
+    fn write_event(
+        &self,
+        writer: &mut Writer<Cursor<&mut Vec<u8>>>,
+        event: &FcpEvent,
+    ) -> Result<()> {
         let mut event_elem = BytesStart::new("event");
         event_elem.push_attribute(("name", event.name.as_str()));
         event_elem.push_attribute(("uid", event.uid.as_str()));
@@ -421,21 +448,21 @@ impl FcpXml {
             asset_elem.push_attribute(("duration", asset.duration.as_str()));
             asset_elem.push_attribute(("hasVideo", if asset.hasVideo { "1" } else { "0" }));
             asset_elem.push_attribute(("hasAudio", if asset.hasAudio { "1" } else { "0" }));
-            
+
             if let Some(format) = &asset.format {
                 asset_elem.push_attribute(("format", format.as_str()));
             }
-            
+
             if let Some(channels) = asset.audioChannels {
                 asset_elem.push_attribute(("audioChannels", channels.to_string().as_str()));
             }
-            
+
             writer.write_event(Event::Empty(asset_elem))?;
         }
 
         writer.write_event(Event::End(BytesEnd::new("resources")))?;
         writer.write_event(Event::End(BytesEnd::new("event")))?;
-        
+
         Ok(())
     }
 
@@ -464,9 +491,7 @@ impl FcpXml {
                         height: 1080,
                         colorSpace: "1-1-1 (Rec. 709)".to_string(),
                     },
-                    spine: FcpSpine {
-                        clips: Vec::new(),
-                    },
+                    spine: FcpSpine { clips: Vec::new() },
                 },
                 events: Vec::new(),
             },
@@ -485,13 +510,22 @@ impl FcpXml {
 
         let mut assets = Vec::new();
         let mut _tracks: Vec<Track> = Vec::new();
-        let mut video_track = Track { name: "V1".to_string(), items: Vec::new() };
-        let mut audio_track = Track { name: "A1".to_string(), items: Vec::new() };
+        let mut video_track = Track {
+            name: "V1".to_string(),
+            items: Vec::new(),
+        };
+        let mut audio_track = Track {
+            name: "A1".to_string(),
+            items: Vec::new(),
+        };
 
         // Convert FCPXML clips back to timeline items
         for clip in &self.project.sequence.spine.clips {
             // Find the corresponding asset
-            let asset = self.project.events.iter()
+            let asset = self
+                .project
+                .events
+                .iter()
                 .flat_map(|e| &e.resources.assets)
                 .find(|a| a.id == clip.ref_id);
 
@@ -541,7 +575,7 @@ impl FcpXml {
 
                 let item = Item {
                     id: clip.uid.clone(),
-                    from: 0, // Parse from clip.start
+                    from: 0,                 // Parse from clip.start
                     duration_in_frames: 150, // Parse from clip.duration
                     kind: item_kind,
                 };

@@ -3,9 +3,9 @@ use std::time::Instant;
 #[derive(Default, Debug, Clone)]
 pub(crate) struct PlaybackClock {
     pub(crate) playing: bool,
-    pub(crate) rate: f64,                 // 1.0 = normal
+    pub(crate) rate: f64, // 1.0 = normal
     pub(crate) anchor_instant: Option<Instant>,
-    pub(crate) anchor_timeline_sec: f64,  // timeline time at anchor
+    pub(crate) anchor_timeline_sec: f64, // timeline time at anchor
 }
 
 impl PlaybackClock {
