@@ -1,3 +1,20 @@
+// Preview behavior settings (frame-based thresholds)
+#[derive(Clone, Copy)]
+struct PreviewSettings {
+    // Accept frames within this many frames when strict-paused
+    strict_tolerance_frames: f32,
+    // Accept frames within this many frames when non-strict paused
+    paused_tolerance_frames: f32,
+    // Only clear the last frame on seek if the target moved beyond this many frames
+    clear_threshold_frames: f32,
+}
+
+impl Default for PreviewSettings {
+    fn default() -> Self {
+        Self { strict_tolerance_frames: 2.5, paused_tolerance_frames: 2.0, clear_threshold_frames: 2.0 }
+    }
+}
+
 struct App {
     db: ProjectDb,
     project_id: String,
@@ -44,6 +61,11 @@ struct App {
     strict_pause: bool,
     // Track when a paused seek was requested (for overlay timing)
     last_seek_request_at: Option<Instant>,
+    // Last presented frame PTS for current source (path, pts seconds)
+    last_present_pts: Option<(String, f64)>,
+    // User settings
+    settings: PreviewSettings,
+    show_settings: bool,
 }
 
 impl App {
@@ -90,6 +112,9 @@ impl App {
             last_play_reanchor_time: None,
             strict_pause: true,
             last_seek_request_at: None,
+            last_present_pts: None,
+            settings: PreviewSettings::default(),
+            show_settings: false,
         };
         app.sync_tracks_from_graph();
         app
@@ -442,6 +467,7 @@ impl eframe::App for App {
                 if ui.button("Jobs").clicked() {
                     self.show_jobs = !self.show_jobs;
                 }
+                if ui.button("Settings").clicked() { self.show_settings = !self.show_settings; }
                 ui.separator();
                 if ui.button(if self.engine.state == PlayState::Playing { "Pause (Space)" } else { "Play (Space)" }).clicked() {
                     let seq_fps = (self.seq.fps.num.max(1) as f64) / (self.seq.fps.den.max(1) as f64);
@@ -460,6 +486,26 @@ impl eframe::App for App {
                 }
             });
         });
+
+        egui::Window::new("Preview Settings")
+            .open(&mut self.show_settings)
+            .resizable(false)
+            .show(ctx, |ui| {
+                ui.label("Frame-based tolerances:");
+                ui.add(
+                    egui::Slider::new(&mut self.settings.strict_tolerance_frames, 0.5..=6.0)
+                        .text("Strict pause tolerance (frames)"),
+                );
+                ui.add(
+                    egui::Slider::new(&mut self.settings.paused_tolerance_frames, 0.5..=6.0)
+                        .text("Paused tolerance (frames)"),
+                );
+                ui.add(
+                    egui::Slider::new(&mut self.settings.clear_threshold_frames, 0.5..=6.0)
+                        .text("Clear threshold on seek (frames)"),
+                );
+                ui.small("Higher tolerance = more off-target frames accepted. Higher clear threshold = fewer blanks on small nudges.");
+            });
 
         // Export dialog UI
         self.export.ui(ctx, &self.seq, &self.db, &self.project_id);

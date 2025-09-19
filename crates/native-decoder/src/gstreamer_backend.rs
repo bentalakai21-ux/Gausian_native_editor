@@ -121,6 +121,34 @@ pub struct GstDecoder {
 }
 
 impl GstDecoder {
+    fn frame_rate(&self) -> f64 {
+        let p = self.props.lock().unwrap();
+        if p.frame_rate.is_finite() && p.frame_rate > 0.0 {
+            p.frame_rate
+        } else {
+            30.0
+        }
+    }
+
+    fn strict_wait_budget_ms(&self) -> u64 {
+        // Wait ~8 frames for preroll; clamp to [500, 1500] ms
+        let fps = self.frame_rate();
+        let per_frame_ms = 1000.0 / fps.max(0.001);
+        let ms = (per_frame_ms * 8.0).round();
+        ms.max(500.0).min(1500.0) as u64
+    }
+
+    fn strict_pull_params(&self) -> (usize, u64) {
+        // Attempts and slice tuned to fps; default (60, 12ms)
+        let fps = self.frame_rate();
+        let attempts = ((fps * 2.0).round() as usize).max(40).min(100);
+        let slice = {
+            let per_frame_ms = 1000.0 / fps.max(0.001);
+            let s = (per_frame_ms / 2.0).round();
+            s.max(8.0).min(16.0) as u64
+        };
+        (attempts, slice)
+    }
     pub fn new<P: AsRef<Path>>(path: P, config: DecoderConfig) -> Result<Self> {
         ensure_gst_init()?;
         let path = path.as_ref();
@@ -185,8 +213,10 @@ impl GstDecoder {
         }
         // In strict paused mode, wait for ASYNC_DONE to ensure preroll readiness.
         if self.strict_paused {
-            // Give the pipeline more time to complete the accurate seek and preroll
-            let deadline = std::time::Instant::now() + std::time::Duration::from_millis(1000);
+            // Give the pipeline time (adaptive) to complete accurate seek + preroll
+            let wait_ms = self.strict_wait_budget_ms();
+            let deadline = std::time::Instant::now()
+                + std::time::Duration::from_millis(wait_ms);
             while std::time::Instant::now() < deadline {
                 if let Some(msg) = self.bus.timed_pop_filtered(
                     gst::ClockTime::from_mseconds(33),
@@ -230,8 +260,11 @@ impl GstDecoder {
         // Pull frames from appsink. In strict paused mode the pipeline is PAUSED and
         // produces a preroll buffer, which must be retrieved via try_pull_preroll.
         // In streaming mode (PLAYING), use try_pull_sample.
-        let attempts = if self.strict_paused { 60 } else { 6 };
-        let slice_ms = if self.strict_paused { 12 } else { 5 };
+        let (attempts, slice_ms) = if self.strict_paused {
+            self.strict_pull_params()
+        } else {
+            (6usize, 5u64)
+        };
         for _ in 0..attempts {
             let sample = if self.strict_paused {
                 self.sink
@@ -480,6 +513,29 @@ impl NativeVideoDecoder for GstDecoder {
             .seek_simple(gst::SeekFlags::FLUSH | gst::SeekFlags::KEY_UNIT, t)
             .map_err(|_| anyhow!("pipeline key-unit seek failed"))?;
         if let Ok(mut last) = self.last_seek.lock() { *last = timestamp; }
+        // Wait for ASYNC_DONE like accurate seek to ensure preroll readiness (adaptive)
+        if self.strict_paused {
+            let wait_ms = self.strict_wait_budget_ms();
+            let deadline = std::time::Instant::now()
+                + std::time::Duration::from_millis(wait_ms);
+            while std::time::Instant::now() < deadline {
+                if let Some(msg) = self.bus.timed_pop_filtered(
+                    gst::ClockTime::from_mseconds(33),
+                    &[gst::MessageType::AsyncDone, gst::MessageType::Error, gst::MessageType::Eos],
+                ) {
+                    use gst::MessageView;
+                    match msg.view() {
+                        MessageView::AsyncDone(_) => break,
+                        MessageView::Error(e) => {
+                            debug!("GStreamer key-unit seek error from {}: {} ({:?})", e.src().map(|s| s.path_string()).unwrap_or_default(), e.error(), e.debug());
+                            break;
+                        }
+                        MessageView::Eos(_) => break,
+                        _ => {}
+                    }
+                }
+            }
+        }
         Ok(())
     }
 }

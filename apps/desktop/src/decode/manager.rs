@@ -274,4 +274,14 @@ impl DecodeManager {
         }
         None
     }
+
+    /// Clear the latest-frame slot to eliminate stale frames after a seek/re-anchor.
+    pub(crate) fn clear_latest(&mut self, path: &str) {
+        let key = Self::normalize_path_key(path);
+        if let Some(w) = self.workers.get(&key) {
+            if let Ok(mut g) = w.slot.0.lock() {
+                *g = None;
+            }
+        }
+    }
 }

@@ -180,6 +180,23 @@ impl App {
                     None => true,
                 };
                 if need {
+                    // Hybrid: only clear if target moved significantly (> ~2 frames)
+                    let mut should_clear = true;
+                    if let Some((ref p, last_pts)) = self.last_present_pts.as_ref() {
+                        if p == &active_path {
+                            let fps_clip = self
+                                .decode_mgr
+                                .take_latest(&active_path)
+                                .map(|f| f.props.fps as f64)
+                                .filter(|v| *v > 0.0 && v.is_finite())
+                                .unwrap_or_else(|| (self.seq.fps.num.max(1) as f64)
+                                    / (self.seq.fps.den.max(1) as f64));
+                            let frame_dur = if fps_clip > 0.0 { 1.0 / fps_clip } else { 1.0 / 30.0 };
+                            let dt_frames = ((media_t - *last_pts).abs() / frame_dur).abs();
+                            should_clear = dt_frames > (self.settings.clear_threshold_frames as f64);
+                        }
+                    }
+                    if should_clear { self.decode_mgr.clear_latest(&active_path); }
                     let _ = self
                         .decode_mgr
                         .send_cmd(&active_path, DecodeCmd::Seek { target_pts: media_t });
@@ -218,6 +235,23 @@ impl App {
                     })
                     .unwrap_or(false);
                 if need || stale_seek {
+                    // Hybrid: only clear if target moved significantly (> ~2 frames)
+                    let mut should_clear = true;
+                    if let Some((ref p, last_pts)) = self.last_present_pts.as_ref() {
+                        if p == &active_path {
+                            let fps_clip = self
+                                .decode_mgr
+                                .take_latest(&active_path)
+                                .map(|f| f.props.fps as f64)
+                                .filter(|v| *v > 0.0 && v.is_finite())
+                                .unwrap_or_else(|| (self.seq.fps.num.max(1) as f64)
+                                    / (self.seq.fps.den.max(1) as f64));
+                            let frame_dur = if fps_clip > 0.0 { 1.0 / fps_clip } else { 1.0 / 30.0 };
+                            let dt_frames = ((media_t - *last_pts).abs() / frame_dur).abs();
+                            should_clear = dt_frames > (self.settings.clear_threshold_frames as f64);
+                        }
+                    }
+                    if should_clear { self.decode_mgr.clear_latest(&active_path); }
                     let _ = self
                         .decode_mgr
                         .send_cmd(&active_path, DecodeCmd::Seek { target_pts: media_t });
@@ -241,22 +275,39 @@ impl App {
                 .filter(|v| *v > 0.0 && v.is_finite())
                 .unwrap_or_else(|| (self.seq.fps.num.max(1) as f64) / (self.seq.fps.den.max(1) as f64));
             let frame_dur = if fps_clip > 0.0 { 1.0 / fps_clip } else { 1.0 / 30.0 };
-            // Accept up to one full frame (or a small floor) to avoid stuck placeholder
-            (1.0 * frame_dur).max(0.020)
+            // Use user-configured hybrid tolerance
+            let frames = if self.strict_pause {
+                self.settings.strict_tolerance_frames as f64
+            } else {
+                self.settings.paused_tolerance_frames as f64
+            };
+            (frames * frame_dur).max(0.020)
         };
+        // Gate what we display to avoid flicker from the old time base:
+        // - While playing: show newest (streaming)
+        // - While seeking/scrubbing with strict_pause: show KEY_UNIT (accurate=false) immediately,
+        //   or only frames near the target; drop far old frames.
+        // - Non-strict: accept frames near the target.
         let picked = if matches!(self.engine.state, PlayState::Playing) {
-            newest
+            newest.clone()
         } else if self.strict_pause {
-            // Strict paused/scrubbing: display the latest frame; fast KEY_UNIT frames are allowed
-            // and will be replaced by an accurate frame when it arrives.
-            newest
+            match newest.as_ref() {
+                Some(f) if !f.accurate => newest.clone(), // allow fast keyframe stage even if far
+                Some(f) if (f.pts - media_t).abs() <= tol => newest.clone(),
+                _ => None,
+            }
         } else {
-            // Responsive paused/scrubbing: prefer close frame; otherwise show newest as fallback.
-            match newest {
-                Some(f) if (f.pts - media_t).abs() <= tol => Some(f),
-                other => other,
+            match newest.as_ref() {
+                Some(f) if (f.pts - media_t).abs() <= tol => newest.clone(),
+                _ => None,
             }
         };
+
+        // If any frame exists while paused, clear the seeking timer to avoid indefinite "seeking…"
+        let has_newest = newest.is_some();
+        if !matches!(self.engine.state, PlayState::Playing) && has_newest {
+            self.last_seek_request_at = None;
+        }
 
         if let Some(frame_out) = picked {
             // Clear seeking timer when we have a frame in paused/scrubbing
@@ -336,6 +387,8 @@ impl App {
                                 );
                                 painter.image(id, rect, uv_rect, egui::Color32::WHITE);
                                 trace!("preview presented frame");
+                                // Update last presented pts for hybrid clearing heuristic
+                                self.last_present_pts = Some((active_path.clone(), frame_out.pts));
                             }
                         }
                     }
