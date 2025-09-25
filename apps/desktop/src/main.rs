@@ -43,13 +43,39 @@ use native_decoder::{
     create_decoder, is_native_decoding_available, DecoderConfig, VideoFrame,
     YuvPixFmt as NativeYuvPixFmt,
 };
-use preview::visual_source_at;
+// use preview::visual_source_at;
 use preview::PreviewState;
 use std::collections::HashMap;
-use std::collections::VecDeque;
-use std::hash::Hash;
+// use std::collections::VecDeque;
+// use std::hash::Hash;
 use walkdir::WalkDir;
 use crossbeam_channel::{unbounded, Receiver, Sender};
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CloudUpdateSrc {
+    Ws,
+    Jobs,
+    Status,
+}
+
+enum ModalEvent {
+    Log(String),
+    JobQueued(String),
+    // (job_id, unique filename prefix)
+    JobQueuedWithPrefix(String, String),
+    // (job_id, [(filename, url)])
+    Recent(Vec<(String, Vec<(String, String)>)>),
+    CloudStatus { pending: usize, running: usize },
+    CloudProgress { job_id: String, progress: f32, current: u32, total: u32, node_id: Option<String> },
+    CloudSource { job_id: String, source: CloudUpdateSrc },
+    JobImporting(String),
+    JobImported(String),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CloudTarget {
+    Prompt,
+    Workflow,
+}
 
 static PRESENT_SIZE_MISMATCH_LOGGED: OnceLock<AtomicBool> = OnceLock::new();
 

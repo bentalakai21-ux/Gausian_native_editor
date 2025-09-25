@@ -480,6 +480,49 @@ impl App {
                 let painter = ui.painter_at(rect);
                 // Background
                 painter.rect_filled(rect, 0.0, egui::Color32::from_rgb(18, 18, 20));
+                // If dragging an asset, show tentative drop indicator under cursor (ghost clip)
+                if let Some(asset) = self.dragging_asset.as_ref() {
+                    if let Some(pos) = ui.input(|i| i.pointer.hover_pos()) {
+                        if rect.contains(pos) {
+                            let track_idx = ((pos.y - rect.top()) / track_h).floor().max(0.0) as usize;
+                            let y0 = rect.top() + track_idx as f32 * track_h;
+                            let start_frames = ((pos.x - rect.left()).max(0.0) as f64
+                                / self.zoom_px_per_frame as f64)
+                                .round()
+                                as i64;
+                            let dur = asset.duration_frames.unwrap_or(150).max(1);
+                            let x0 = rect.left() + start_frames as f32 * self.zoom_px_per_frame;
+                            let x1 = x0 + (dur as f32 * self.zoom_px_per_frame).max(12.0);
+                            let r = egui::Rect::from_min_max(
+                                egui::pos2(x0, y0 + 4.0),
+                                egui::pos2(x1, y0 + track_h - 4.0),
+                            );
+                            let is_audio = asset.kind.eq_ignore_ascii_case("audio");
+                            let fill = if is_audio {
+                                egui::Color32::from_rgba_unmultiplied(40, 160, 60, 120)
+                            } else {
+                                egui::Color32::from_rgba_unmultiplied(60, 120, 220, 120)
+                            };
+                            painter.rect_filled(r, 4.0, fill);
+                            painter.rect_stroke(
+                                r,
+                                4.0,
+                                egui::Stroke::new(1.0, egui::Color32::from_rgb(250, 250, 180)),
+                            );
+                            let name = std::path::Path::new(&asset.src_abs)
+                                .file_name()
+                                .map(|s| s.to_string_lossy().into_owned())
+                                .unwrap_or_else(|| asset.src_abs.clone());
+                            painter.text(
+                                r.center_top() + egui::vec2(0.0, 12.0),
+                                egui::Align2::CENTER_TOP,
+                                name,
+                                egui::FontId::monospace(12.0),
+                                egui::Color32::WHITE,
+                            );
+                        }
+                    }
+                }
                 // Vertical grid each second
                 let fps =
                     (self.seq.fps.num.max(1) as f32 / self.seq.fps.den.max(1) as f32).max(1.0);
@@ -689,7 +732,7 @@ impl App {
                 );
 
                 // Click/drag background to scrub (when not dragging a clip)
-                if self.drag.is_none() {
+                if self.drag.is_none() && self.dragging_asset.is_none() {
                     // Single click: move playhead on mouse up as well
                     if response.clicked() {
                         if let Some(pos) = response.interact_pointer_pos() {
@@ -750,6 +793,18 @@ impl App {
                 if !ui.input(|i| i.pointer.primary_down()) {
                     if let Some(drag) = self.drag.take() {
                         completed_drag = Some(drag);
+                    }
+                    // Drop asset onto timeline if any
+                    if let Some(asset) = self.dragging_asset.take() {
+                        if let Some(pos) = ui.input(|i| i.pointer.hover_pos()) {
+                            if rect.contains(pos) {
+                                let local_x = (pos.x - rect.left()).max(0.0) as f64;
+                                let frames = (local_x / self.zoom_px_per_frame as f64).round() as i64;
+                                let track_idx = ((pos.y - rect.top()) / track_h).floor() as isize;
+                                let track_idx = track_idx.clamp(0, (self.seq.graph.tracks.len().saturating_sub(1)) as isize) as usize;
+                                self.insert_asset_at(&asset, track_idx, frames);
+                            }
+                        }
                     }
                 } else if let Some(pos) = ui.input(|i| i.pointer.interact_pos()) {
                     if let Some(mut drag) = self.drag.take() {

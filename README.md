@@ -1,223 +1,119 @@
-# 🎬 Gausian Native Editor
+# Gausian Native Editor
 
-A high-performance, cross-platform video editor built in Rust with GPU acceleration and professional interchange support.
+A fast, native video editor and preview tool written in Rust with optional cloud rendering/encoding via Modal and ComfyUI.
 
-## ✨ Features
+This README captures purpose/scope, current architecture, exact stack versions, how to run, and recent decisions so the project state stays discoverable.
 
-### Core Capabilities
+## Purpose / Scope
 
-- **Native Performance**: 100% Rust implementation with GPU-accelerated preview and rendering
-- **Professional Interchange**: FCPXML, FCP7 XML, and EDL import/export for seamless workflow integration
-- **Plugin System**: Support for Rust/WASM and Python plugins with sandbox execution
-- **Hardware Acceleration**: Automatic detection and utilization of hardware encoders (VideoToolbox, NVENC, QSV, VAAPI)
-- **Advanced Timeline**: Multi-track editing with precise frame-level control, snapping, and trimming tools
-- **Audio Integration**: Real-time audio playback synchronized with video timeline
+- Native desktop editor (Rust/egui) with timeline, assets, and real‑time preview
+- Local media import (FFmpeg/ffprobe), auto‑import from ComfyUI outputs
+- Cloud workflow (optional): submit ComfyUI jobs and monitor completions; import finished artifacts automatically
+- Modal scaffold (optional): H100 generator (frames) + L4 encoder (NVENC)
 
-### Technical Highlights
+## Architecture (brief)
 
-- **GPU Pipeline**: wgpu-based renderer with WGSL shaders for YUV→RGB conversion, scaling, blending, and transforms
-- **Memory Safety**: Zero unsafe code in core logic, robust error handling
-- **Modular Architecture**: Clean separation between timeline, rendering, media I/O, and export systems
-- **Cross-Platform**: Works on macOS, Windows, and Linux with native performance
+- apps/desktop (Rust/egui):
+  - Assets panel, timeline, GPU preview, export
+  - Local ComfyUI integration (embed optional; default OFF)
+  - Auto‑import from ComfyUI output folder (videos + images; true move semantics)
+  - Cloud section: queue job to /prompt, live job monitors (ComfyUI WS and Cloud WS)
 
-## 🚀 Getting Started
+- crates/* (Rust):
+  - timeline: graph, tracks, clips, command history
+  - project: SQLite DB, assets table, project timeline JSON persistence
+  - media-io: FFmpeg probing/exports (requires ffprobe on PATH)
+  - exporters, renderer, jobs, plugin-host (as in source tree)
 
-### Prerequisites
+- modal_app (Python; scaffold):
+  - generate_frames (H100): emit frames + manifest.json to S3
+  - encode_video (L4): NVENC encode frames → MP4; fallback to libx264
+  - /health endpoint for connectivity checks
 
-1. **Rust toolchain** (latest stable):
+## Stack and exact versions
 
-   ```bash
-   curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
-   ```
+Rust workspace (see Cargo.toml):
+- egui = 0.29
+- eframe = 0.29 (wgpu feature)
+- wgpu = 0.20
+- symphonia = 0.5
+- crossbeam‑channel = 0.5
+- walkdir = 2
+- ureq = 2
+- tungstenite = 0.21
+- url = 2, urlencoding = 2
+- native‑decoder (local crate; gstreamer feature)
 
-2. **FFmpeg** (required for media processing):
+External tools:
+- FFmpeg/ffprobe (system) — required for import/metadata
 
-   ```bash
-   # macOS
-   brew install ffmpeg
+Modal scaffold (Python):
+- Python 3.10+
+- modal, boto3, requests, Pillow (see modal_app/requirements.txt)
+- Base images: nvidia/cuda:12.1.1‑runtime‑ubuntu22.04
 
-   # Ubuntu/Debian
-   sudo apt install ffmpeg
+## How to run (desktop)
 
-   # Windows
-   # Download from https://ffmpeg.org/download.html
-   ```
+Prereqs:
+- Install Rust (stable) and FFmpeg/ffprobe on PATH
 
-### Building from Source
-
+Build & run:
 ```bash
-# Clone the repository
-cd /Users/mingeonkim/LocalDocuments/GausianAI
-
-# Build the project
-cargo build --release
-
-# Or build in development mode (faster compilation, slower runtime)
 cargo build
-```
-
-## 🖥️ Running the Application
-
-### Desktop GUI Application
-
-```bash
-# Run the desktop editor
 cargo run --bin desktop
-
-# Or run the release build for better performance
-cargo run --release --bin desktop
 ```
 
-**Desktop Features:**
+Quick tour:
+- Assets → Import… to add media
+- ComfyUI (local): set Repo Path (folder with main.py) and enable Auto‑import if you want local outputs to be imported automatically
+- Cloud (Modal): always visible; set Base URL and API Key, choose Target (ComfyUI /prompt or Workflow (auto‑convert)), paste JSON payload, Test Connection, Queue Job
+- Live job monitor: toggle per Cloud section (cloud WS) and in ComfyUI header (local WS). The app auto‑imports artifacts on job completion
 
-- **Timeline Editor**: Drag-and-drop video/audio clips, trim, move, and arrange
-- **Asset Browser**: Import media files with automatic metadata detection
-- **Real-time Preview**: GPU-accelerated video preview with audio synchronization
-- **Export Options**: Export to MP4/MOV video or FCPXML/EDL for other editors
-- **Hardware Detection**: Automatic detection of available hardware encoders
+Default behavior:
+- ComfyUI “Open inside editor” is OFF by default
+- New projects create 3 video + 3 audio baseline tracks (V1..V3, A1..A3)
 
-### Command Line Interface
+## How to run (Modal scaffold)
 
 ```bash
-# Show all available commands
-cargo run --bin gausian-cli -- --help
+# from repo root
+pip install -r modal_app/requirements.txt  # for local tooling
 
-# Create a new project
-cargo run --bin gausian-cli -- new "My Project" --width 1920 --height 1080 --fps 30
+# (one‑time) create Modal secret if you aren’t using IAM
+modal secret create aws-credentials
 
-# Import media files into a project
-cargo run --bin gausian-cli -- import --project my_project.gausian file1.mp4 file2.mp4 --proxies --thumbnails
+# deploy the app
+modal deploy modal_app/app.py
 
-# Export a sequence
-cargo run --bin gausian-cli -- export --project my_project.gausian --sequence "Main" --output export.mp4 --preset h264-1080p
-
-# Convert between formats
-cargo run --bin gausian-cli -- convert input.fcpxml output.edl --output-format edl
-
-# Analyze media files
-cargo run --bin gausian-cli -- analyze video1.mp4 video2.mp4 --waveforms --output analysis.json
-
-# List available hardware encoders
-cargo run --bin gausian-cli -- encoders
+# smoke tests
+modal run modal_app.app::health
+modal run modal_app.app::generate_frames --job-id test123 --bucket your-bucket
+modal run modal_app.app::encode_video --job-id test123 --bucket your-bucket --codec h264_nvenc
 ```
 
-## 🏗️ Architecture Overview
+Notes:
+- encode_video requires an NVENC‑capable GPU (L4/T4/A10G/RTX) and an FFmpeg build with NVENC enabled. The Dockerfile is a scaffold—replace with your NVENC build.
+- generate_frames currently draws synthetic frames. Replace with a ComfyUI runner that writes real frames.
 
-### Crate Structure
+## Recent decisions (changelog‑lite)
 
-```
-crates/
-├── timeline/          # Timeline graph, tracks, clips, effects, keyframes
-├── project/           # SQLite project format, migrations, autosave
-├── media-io/          # FFmpeg bindings, metadata, decode/encode, proxies
-├── renderer/          # wgpu kernels (YUV→RGB, scale, blend, transforms)
-├── exporters/         # FCPXML, FCP7 XML, EDL export/import
-├── plugin-host/       # Rust/WASM plugin ABI, Python bridge
-└── cli/               # Command-line interface
+- Tracks: default to 3 video + 3 audio; name V1..V3, A1..A3
+- Local ComfyUI auto‑import: supports images + videos; true move semantics; project routing fixed; base‑path self‑heal when set to a file
+- Local watcher starts when repo_path/output exists; no need to run ComfyUI embed
+- Cloud section: always visible (decoupled from local embed)
+- Scrolling fix: payload editor and logs now have explicit id_source to avoid egui ID collisions
+- Cloud queue: POSTs to /prompt; error bodies surfaced on non‑2xx
+- Cloud target: Prompt vs Workflow (auto‑wrap / best‑effort convert)
+- Live monitors: local WS (/ws) and cloud WS (/events) implemented; non‑blocking stop on toggle
+- Default “Open inside editor” unchecked
 
-apps/
-└── desktop/           # Native desktop application (eframe/egui)
-```
+## Troubleshooting
 
-### Database Schema
+- Nothing imports from ComfyUI: ensure repo_path is saved and output dir exists; ffprobe installed; check Auto‑import Logs
+- Cloud job 404 on queue: Base URL points to raw ComfyUI (/prompt), not /jobs; selector should be “ComfyUI /prompt”
+- 400 on /prompt: JSON must be a ComfyUI API prompt (wrap as {"prompt": {…}, "client_id": "…"}) or use Workflow target
+- NVENC errors in cloud encode on H100: H100 has no NVENC; use L4 for encode or fallback to libx264
 
-The project uses SQLite with a comprehensive schema supporting:
-
-- **Projects**: Multi-project management with settings
-- **Sequences**: Timeline sequences with metadata
-- **Assets**: Media files with metadata, proxies, and cache
-- **Usages**: Track how assets are used in sequences
-- **Proxies**: Low-resolution proxies for performance
-- **Cache**: Thumbnails, waveforms, and analysis data
-
-## 🎯 Usage Examples
-
-### Basic Video Editing Workflow
-
-1. **Start the desktop app**:
-
-   ```bash
-   cargo run --bin desktop
-   ```
-
-2. **Import media files**:
-
-   - Click "Import..." button in the Assets panel
-   - Select your video/audio files
-   - Files will be automatically analyzed and added to the asset library
-
-3. **Build your timeline**:
-
-   - Drag assets from the Assets panel to the timeline
-   - Use mouse to select, move, and trim clips
-   - Clips automatically snap to frame boundaries and seconds
-
-4. **Preview your edit**:
-
-   - Press Space or click Play to preview
-   - Audio and video are synchronized automatically
-   - GPU-accelerated preview for smooth playback
-
-5. **Export your project**:
-   - Click "Export..." in the top toolbar
-   - Choose format: MP4/MOV for video, FCPXML/EDL for other editors
-   - Export will be processed using hardware encoders when available
-
-### Professional Workflow Integration
-
-**Export to Final Cut Pro**:
-
-```bash
-cargo run --bin gausian-cli -- convert my_timeline.json final_cut.fcpxml --output-format fcpxml
-```
-
-**Export to Avid/Premiere (EDL)**:
-
-```bash
-cargo run --bin gausian-cli -- convert my_timeline.json avid_edit.edl --output-format edl
-```
-
-**Batch Processing**:
-
-```bash
-# Analyze multiple files
-cargo run --bin gausian-cli -- analyze *.mp4 --waveforms --output batch_analysis.json
-
-# Import with proxy generation
-cargo run --bin gausian-cli -- import --project batch_project.gausian *.mp4 --proxies --thumbnails
-```
-
-## 🔧 Development
-
-### Adding New Features
-
-The modular architecture makes it easy to extend:
-
-1. **New Export Formats**: Add to `crates/exporters/src/`
-2. **New Effects**: Add to `crates/renderer/src/` with WGSL shaders
-3. **New Media Formats**: Extend `crates/media-io/src/`
-4. **New Plugins**: Use the plugin SDK in `crates/plugin-host/`
-
-### Plugin Development
-
-**Rust/WASM Plugin**:
-
-```rust
-// plugin.rs
-#[no_mangle]
-pub extern "C" fn plugin_main() -> i32 {
-    // Your effect logic here
-    0 // Return 0 for success
-}
-```
-
-**Python Plugin**:
-
-```python
-# plugin.py
-def process(context):
-    # Access timeline data
-    sequence = context['sequence']
     parameters = context['parameters']
 
     # Your processing logic here

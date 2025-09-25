@@ -20,13 +20,15 @@ pub struct PipConfig {
 pub struct ComfyUiConfig {
     pub repo_path: Option<PathBuf>,
     pub python_cmd: String,
+    pub host: String,
     pub port: u16,
+    pub https: bool,
 }
 
 impl Default for ComfyUiConfig {
     fn default() -> Self {
         let python_cmd = if cfg!(target_os = "windows") { "python" } else { "python3" }.to_string();
-        Self { repo_path: None, python_cmd, port: 8188 }
+        Self { repo_path: None, python_cmd, host: "127.0.0.1".into(), port: 8188, https: false }
     }
 }
 
@@ -96,7 +98,10 @@ impl ComfyUiManager {
     pub fn config_mut(&mut self) -> &mut ComfyUiConfig { &mut self.cfg }
     pub fn config(&self) -> &ComfyUiConfig { &self.cfg }
 
-    pub fn url(&self) -> String { format!("http://127.0.0.1:{}", self.cfg.port) }
+    pub fn url(&self) -> String {
+        let scheme = if self.cfg.https { "https" } else { "http" };
+        format!("{}://{}:{}", scheme, self.cfg.host, self.cfg.port)
+    }
 
     pub fn default_install_dir() -> PathBuf {
         app_data_dir().join("comfyui")

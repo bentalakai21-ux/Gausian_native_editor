@@ -20,6 +20,97 @@ import threading
 import time
 import urllib.request
 import modal
+import random
+try:
+    from botocore.exceptions import ClientError, NoCredentialsError, EndpointConnectionError
+except Exception:  # botocore may not be present until runtime
+    ClientError = NoCredentialsError = EndpointConnectionError = Exception
+from typing import Callable, Optional, Dict, List, Set
+
+# Global progress/state shared across threads and ASGI app
+global_progress: Dict[str, object] = {
+    'jobs': {},  # job_id -> progress_data
+    'last_update': time.time(),
+}
+job_artifacts: Dict[str, List[str]] = {}
+event_publisher: Optional[Callable[[dict], None]] = None
+job_meta: Dict[str, dict] = {}
+# Expected filename prefix per job (e.g., teacache-<uuid>), used to filter artifacts
+job_prefixes: Dict[str, str] = {}
+# Remote/public URLs by job id and filename (to avoid /view cold-starts)
+# S3 object keys by job id and filename (to generate presigned URLs on demand)
+job_object_keys: Dict[str, Dict[str, str]] = {}
+downloads_seen: Set[str] = set()
+# Clients may post an explicit ACK when they finish importing artifacts for a job.
+# This prevents premature shutdown when downloads are proxied externally.
+jobs_imported_ack: Set[str] = set()
+job_completed_at: Dict[str, float] = {}
+
+# Persistent job state helpers (cross-replica)
+def _jobs_dir() -> pathlib.Path:
+    p = pathlib.Path("/userdir") / "jobs"
+    p.mkdir(parents=True, exist_ok=True)
+    return p
+
+def _job_state_path(job_key: str) -> pathlib.Path:
+    return _jobs_dir() / f"{job_key}.json"
+
+def _persist_job_state(job_key: str, patch: dict) -> None:
+    try:
+        path = _job_state_path(job_key)
+        cur = {}
+        if path.exists():
+            try:
+                import json as _j
+                cur = _j.loads(path.read_text(encoding="utf-8")) or {}
+            except Exception:
+                cur = {}
+        # Merge patch with monotonic progress semantics
+        # Never downgrade from completed -> running/error
+        incoming_status = patch.get("status")
+        if incoming_status:
+            prev_status = cur.get("status")
+            if prev_status == "completed" and incoming_status != "completed":
+                patch = dict(patch)
+                patch.pop("status", None)
+        # Monotonic counters
+        for k in ("current_step", "total_steps"):
+            if k in patch:
+                try:
+                    prev = int(cur.get(k, 0) or 0)
+                    newv = int(patch.get(k) or 0)
+                    if newv < prev:
+                        patch = dict(patch)
+                        patch[k] = prev
+                except Exception:
+                    pass
+        if "progress_percent" in patch:
+            try:
+                prev = float(cur.get("progress_percent", 0.0) or 0.0)
+                newv = float(patch.get("progress_percent") or 0.0)
+                if newv < prev:
+                    patch = dict(patch)
+                    patch["progress_percent"] = prev
+            except Exception:
+                pass
+        cur.update(patch)
+        # Always include the id and a timestamp
+        cur.setdefault("id", job_key)
+        cur["updated_at"] = time.time()
+        import json as _j
+        path.write_text(_j.dumps(cur), encoding="utf-8")
+    except Exception as e:
+        print(f"[JOB-STATE] persist failed for {job_key}: {e}", flush=True)
+
+def _read_job_state(job_key: str) -> Optional[dict]:
+    try:
+        path = _job_state_path(job_key)
+        if not path.exists():
+            return None
+        import json as _j
+        return _j.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
 
 
 
@@ -196,7 +287,7 @@ def _wait_until_ready(timeout_s: int = 840) -> None:
     raise RuntimeError("ComfyUI failed to start on port 8188 within the timeout window")
 
 
-def _monitor_job_completion(job_id, job_manager_instance):
+def _monitor_job_completion(job_id, prompt_id, job_manager_instance, plan_or_total: Optional[object] = None):
     """Monitor a job for completion using ComfyUI WebSocket for real progress."""
     try:
         import json
@@ -208,15 +299,30 @@ def _monitor_job_completion(job_id, job_manager_instance):
         
         print(f"[MONITOR] Starting WebSocket monitoring for job: {job_id}", flush=True)
         
-        # Track initial video count
+        # Track initial video set (recursive)
         output_dir = Path("/outputs")
-        initial_videos = set(f.name for f in output_dir.glob("*.mp4"))
+        def _list_videos() -> set[str]:
+            vids: set[str] = set()
+            try:
+                for f in output_dir.rglob("*.mp4"):
+                    try:
+                        rel = f.relative_to(output_dir).as_posix()
+                    except Exception:
+                        rel = f.name
+                    vids.add(rel)
+            except Exception:
+                pass
+            return vids
+        initial_videos = _list_videos()
         initial_count = len(initial_videos)
         print(f"[MONITOR] Initial video count: {initial_count}", flush=True)
         
+        # Prefer prompt_id as the authoritative id (matches the id returned to clients)
+        key_id = str(prompt_id) if prompt_id is not None else str(job_id)
+
         # Progress tracking variables
         progress_data = {
-            'job_id': job_id,
+            'job_id': key_id,
             'total_steps': 0,
             'current_step': 0,
             'progress_percent': 0,
@@ -224,6 +330,48 @@ def _monitor_job_completion(job_id, job_manager_instance):
             'videos_generated': 0,
             'expected_videos': 1,  # Will be updated based on job
         }
+
+        # Aggregate planning: weights per sampler node and encode nodes
+        per_node_weights: dict[str, int] = {}
+        per_node_progress: dict[str, float] = {}
+        encode_weights: dict[str, int] = {}
+        encode_done: set[str] = set()
+        total_steps_plan = 0
+        if isinstance(plan_or_total, dict):
+            try:
+                per_node_weights = {str(k): int(v) for k, v in (plan_or_total.get('weights') or {}).items() if int(v) > 0}
+            except Exception:
+                per_node_weights = {}
+            try:
+                encode_weights = {str(k): int(v) for k, v in (plan_or_total.get('encode_weights') or {}).items() if int(v) > 0}
+            except Exception:
+                encode_weights = {}
+            try:
+                total_steps_plan = int(plan_or_total.get('total_steps') or 0)
+            except Exception:
+                total_steps_plan = 0
+        elif isinstance(plan_or_total, int) and plan_or_total > 0:
+            total_steps_plan = int(plan_or_total)
+
+        if total_steps_plan > 0:
+            # Normalize UI total to number of frames if available
+            frames = 0
+            try:
+                frames = int((plan_or_total or {}).get('frames') or 0) if isinstance(plan_or_total, dict) else 0
+            except Exception:
+                frames = 0
+            norm_total = frames if frames > 0 else total_steps_plan
+            progress_data['total_steps'] = norm_total
+            _persist_job_state(key_id, {'total_steps': norm_total})
+
+        # Initialize persistent state for this job
+        _persist_job_state(key_id, {
+            'status': 'running',
+            'current_step': 0,
+            'total_steps': 0,
+            'progress_percent': 0,
+            'artifacts': [],
+        })
         
         def on_websocket_message(ws, message):
             try:
@@ -231,16 +379,77 @@ def _monitor_job_completion(job_id, job_manager_instance):
                 msg_type = data.get('type')
                 
                 if msg_type == 'progress':
-                    # Real-time progress from ComfyUI
-                    progress_data['current_step'] = data.get('value', 0)
-                    progress_data['total_steps'] = data.get('max', 1)
-                    progress_data['progress_percent'] = (progress_data['current_step'] / progress_data['total_steps']) * 100 if progress_data['total_steps'] > 0 else 0
+                    # Real-time progress from ComfyUI — aggregate across sampler nodes when plan present
+                    dd = data.get('data') or {}
+                    node_id = str(dd.get('node')) if dd.get('node') is not None else None
+                    if node_id and per_node_weights:
+                        try:
+                            vmax = int(dd.get('max', 1) or 1)
+                            vcur = int(dd.get('value', 0) or 0)
+                            vmax = max(1, vmax)
+                            per_node_progress[node_id] = max(0.0, min(1.0, vcur / float(vmax)))
+                        except Exception:
+                            pass
+                        # Aggregate: sum(weight * progress) + encode_done
+                        agg = sum(per_node_weights.get(nid, 0) * per_node_progress.get(nid, 0.0) for nid in per_node_weights.keys()) + sum(encode_weights.get(nid, 0) for nid in encode_done)
+                        # Normalize aggregate to frames so progress reaches 100% by the time frames complete
+                        frames = 0
+                        try:
+                            frames = int((plan_or_total or {}).get('frames') or 0) if isinstance(plan_or_total, dict) else 0
+                        except Exception:
+                            frames = 0
+                        total_full = max(1, (sum(per_node_weights.values()) + sum(encode_weights.values())) or total_steps_plan or 1)
+                        total_norm = frames if frames > 0 else total_full
+                        cur_norm = int(round((agg / float(total_full)) * total_norm))
+                        cur_norm = max(0, min(total_norm, cur_norm))
+                        progress_data['current_step'] = cur_norm
+                        progress_data['total_steps'] = total_norm
+                        progress_data['progress_percent'] = (cur_norm / float(total_norm)) * 100.0 if total_norm > 0 else 0.0
+                    else:
+                        # Fallback: per-message value/max, normalized to frames if known
+                        raw_cur = int(dd.get('value', 0) or 0)
+                        raw_tot = int(dd.get('max', 1) or 1)
+                        frames = 0
+                        try:
+                            frames = int((plan_or_total or {}).get('frames') or 0) if isinstance(plan_or_total, dict) else 0
+                        except Exception:
+                            frames = 0
+                        if frames > 0 and raw_tot > 0:
+                            cur_norm = int(round((raw_cur / float(raw_tot)) * frames))
+                            cur_norm = max(0, min(frames, cur_norm))
+                            progress_data['current_step'] = cur_norm
+                            progress_data['total_steps'] = frames
+                            progress_data['progress_percent'] = (cur_norm / float(frames)) * 100.0
+                        else:
+                            progress_data['current_step'] = raw_cur
+                            progress_data['total_steps'] = max(1, raw_tot)
+                            progress_data['progress_percent'] = (raw_cur / float(max(1, raw_tot))) * 100.0
                     
-                    # Update global progress state
-                    global_progress['jobs'][job_id] = progress_data.copy()
+                    # Update global progress map (dict mutation; no rebinding)
+                    global_progress['jobs'][key_id] = progress_data.copy()
                     global_progress['last_update'] = time.time()
                     
                     print(f"[PROGRESS] {job_id}: {progress_data['current_step']}/{progress_data['total_steps']} ({progress_data['progress_percent']:.1f}%)", flush=True)
+                    # Push live progress to external clients (include node if present)
+                    try:
+                        if event_publisher is not None:
+                            event_publisher({
+                                "type": "progress",
+                                "job_id": key_id,
+                                "current_step": progress_data['current_step'],
+                                "total_steps": progress_data['total_steps'],
+                                "progress_percent": progress_data['progress_percent'],
+                                "node_id": data.get('node') or dd.get('node'),
+                            })
+                    except Exception:
+                        pass
+                    # Persist progress for cross-replica polling
+                    _persist_job_state(key_id, {
+                        'status': 'running',
+                        'current_step': progress_data['current_step'],
+                        'total_steps': progress_data['total_steps'],
+                        'progress_percent': progress_data['progress_percent'],
+                    })
                 
                 elif msg_type == 'executing':
                     node_id = data.get('data', {}).get('node')
@@ -248,12 +457,53 @@ def _monitor_job_completion(job_id, job_manager_instance):
                         print(f"[EXECUTING] {job_id}: Node {node_id}", flush=True)
                 
                 elif msg_type == 'executed':
-                    # Check if this is a video generation completion
+                    # Check if this is a video generation completion and update aggregate
                     node_data = data.get('data', {})
+                    node_id = str(node_data.get('node')) if node_data.get('node') is not None else None
                     if 'output' in node_data and 'videos' in str(node_data):
                         progress_data['videos_generated'] += 1
-                        global_progress['jobs'][job_id] = progress_data.copy()
+                        global_progress['jobs'][key_id] = progress_data.copy()
                         print(f"[VIDEO-COMPLETE] {job_id}: Video {progress_data['videos_generated']} generated", flush=True)
+                    # Mark sampler nodes as completed if they lack granular progress
+                    if node_id and (per_node_weights or encode_weights):
+                        if node_id in per_node_weights:
+                            per_node_progress[node_id] = 1.0
+                        if node_id in encode_weights:
+                            encode_done.add(node_id)
+                        agg = sum(per_node_weights.get(nid, 0) * per_node_progress.get(nid, 0.0) for nid in per_node_weights.keys()) + sum(encode_weights.get(nid, 0) for nid in encode_done)
+                        # Normalize aggregate to frames
+                        frames = 0
+                        try:
+                            frames = int((plan_or_total or {}).get('frames') or 0) if isinstance(plan_or_total, dict) else 0
+                        except Exception:
+                            frames = 0
+                        total_full = max(1, (sum(per_node_weights.values()) + sum(encode_weights.values())) or total_steps_plan or 1)
+                        total_norm = frames if frames > 0 else total_full
+                        cur_norm = int(round((agg / float(total_full)) * total_norm))
+                        cur_norm = max(0, min(total_norm, cur_norm))
+                        progress_data['current_step'] = cur_norm
+                        progress_data['total_steps'] = total_norm
+                        progress_data['progress_percent'] = (cur_norm / float(total_norm)) * 100.0 if total_norm > 0 else 0.0
+                        global_progress['jobs'][key_id] = progress_data.copy()
+                        _persist_job_state(key_id, {
+                            'status': 'running',
+                            'current_step': progress_data['current_step'],
+                            'total_steps': progress_data['total_steps'],
+                            'progress_percent': progress_data['progress_percent'],
+                        })
+
+                elif msg_type == 'execution_end':
+                    # Strong completion signal for this prompt_id
+                    dd = data.get('data') or {}
+                    pid = dd.get('prompt_id')
+                    try:
+                        matches = str(pid) == str(prompt_id)
+                    except Exception:
+                        matches = False
+                    if matches:
+                        progress_data['progress_percent'] = max(100.0, progress_data.get('progress_percent', 0))
+                        global_progress['jobs'][key_id] = progress_data.copy()
+                        print(f"[EXECUTION-END] {job_id}: prompt {prompt_id}", flush=True)
                 
             except Exception as e:
                 print(f"[WEBSOCKET] Error parsing message: {e}", flush=True)
@@ -267,8 +517,13 @@ def _monitor_job_completion(job_id, job_manager_instance):
         def on_websocket_open(ws):
             print(f"[WEBSOCKET] Connected for {job_id}", flush=True)
         
-        # Start WebSocket connection to ComfyUI
-        ws_url = "ws://127.0.0.1:8188/ws"
+        # Start WebSocket connection to ComfyUI (bind to clientId for per-job updates)
+        try:
+            from urllib.parse import quote as _q
+        except Exception:
+            def _q(s):
+                return s
+        ws_url = f"ws://127.0.0.1:8188/ws?clientId={_q(str(job_id))}"
         ws = websocket.WebSocketApp(ws_url,
                                   on_open=on_websocket_open,
                                   on_message=on_websocket_message,
@@ -287,8 +542,8 @@ def _monitor_job_completion(job_id, job_manager_instance):
             try:
                 current_time = time.time()
                 
-                # Check for new video files
-                current_videos = set(f.name for f in output_dir.glob("*.mp4"))
+                # Check for new video files (recursive)
+                current_videos = _list_videos()
                 new_videos = current_videos - initial_videos
                 videos_generated = len(new_videos)
                 
@@ -313,19 +568,141 @@ def _monitor_job_completion(job_id, job_manager_instance):
                 
                 # Upload new videos immediately when detected
                 if new_videos:
-                    for video_name in new_videos:
-                        video_path = output_dir / video_name
-                        if video_path.exists() and video_name not in job_manager_instance.uploaded_videos:
-                            job_manager_instance.uploaded_videos.add(video_name)
-                            print(f"[MONITOR] Uploading new video: {video_name}", flush=True)
-                            success = _upload_to_backblaze(str(video_path))
-                            if not success:
-                                job_manager_instance.uploaded_videos.discard(video_name)
+                    for video_rel in new_videos:
+                        video_path = output_dir / video_rel
+                        if video_path.exists() and video_rel not in job_manager_instance.uploaded_videos:
+                            job_manager_instance.uploaded_videos.add(video_rel)
+                            print(f"[MONITOR] Uploading new video: {video_rel}", flush=True)
+                            try:
+                                job_manager_instance.upload_started()
+                            except Exception:
+                                pass
+                            try:
+                                meta = None
+                                try:
+                                    meta = job_meta.get(key_id) or job_meta.get(str(job_id))
+                                except Exception:
+                                    meta = None
+                                ok, key = _upload_to_backblaze(str(video_path), meta=meta)
+                                if ok and key:
+                                    try:
+                                        job_object_keys.setdefault(key_id, {})[video_rel] = key
+                                    except Exception:
+                                        pass
+                                if not ok:
+                                    job_manager_instance.uploaded_videos.discard(video_rel)
+                            finally:
+                                try:
+                                    job_manager_instance.upload_finished()
+                                except Exception:
+                                    pass
+                    # Persist artifacts list as we discover videos (filter by expected prefix if available)
+                    try:
+                        try:
+                            expect_prefix = job_prefixes.get(key_id) or job_prefixes.get(str(job_id))
+                        except Exception:
+                            expect_prefix = None
+                        rels = []
+                        for _p in current_videos:
+                            try:
+                                rel = _p.relative_to(output_dir).as_posix()
+                            except Exception:
+                                rel = _p.name
+                            if expect_prefix:
+                                # Compare against basename to avoid subfolder mismatch
+                                base = (_p.name)
+                                if not base.startswith(expect_prefix):
+                                    continue
+                            rels.append(rel)
+                        artifacts_list = sorted(rels)
+                        _persist_job_state(key_id, {'artifacts': artifacts_list})
+                    except Exception:
+                        pass
                 
-                # Complete job only when truly finished
-                if no_queue_activity and has_new_videos and (progress_stalled or progress_data['progress_percent'] >= 95):
+                # Complete job when Comfy queue is empty (all nodes executed)
+                if no_queue_activity:
                     print(f"[MONITOR] Job {job_id} TRULY complete - Queue empty, videos generated, progress stalled", flush=True)
+                    # Record artifacts for /jobs API
+                    try:
+                        global job_artifacts, job_completed_at
+                        arts: list[str] = []
+                        try:
+                            import urllib.request as _url, json as _j
+                            if prompt_id:
+                                r = _url.urlopen(f"http://127.0.0.1:8188/history/{prompt_id}", timeout=10)
+                                d = _j.loads(r.read().decode())
+                                root = d.get(prompt_id) or d
+                                outs = root.get("outputs") if isinstance(root, dict) else None
+                                if isinstance(outs, dict):
+                                    for _nid, entry in outs.items():
+                                        varr = entry.get("videos") if isinstance(entry, dict) else None
+                                        if isinstance(varr, list):
+                                            for it in varr:
+                                                fn = (it or {}).get("filename")
+                                                sub = (it or {}).get("subfolder", "")
+                                                if isinstance(fn, str) and fn:
+                                                    rel = (Path(sub) / fn).as_posix() if sub else fn
+                                                    arts.append(rel)
+                        except Exception:
+                            pass
+                        if not arts:
+                            try:
+                                expect_prefix = job_prefixes.get(key_id) or job_prefixes.get(str(job_id))
+                            except Exception:
+                                expect_prefix = None
+                            rels = []
+                            for _p in current_videos:
+                                try:
+                                    rel = _p.relative_to(output_dir).as_posix()
+                                except Exception:
+                                    rel = _p.name
+                                if expect_prefix:
+                                    if not _p.name.startswith(expect_prefix):
+                                        continue
+                                rels.append(rel)
+                            arts = sorted(rels)
+                        job_artifacts[key_id] = sorted(list(set(arts)))
+                        job_completed_at[key_id] = time.time()
+                    except Exception:
+                        pass
+                    # Persist completed state for cross-replica clients
+                    try:
+                        _persist_job_state(key_id, {
+                            'status': 'completed',
+                            'progress_percent': 100.0,
+                            'artifacts': job_artifacts.get(key_id, []),
+                            'completed_at': time.time(),
+                        })
+                    except Exception:
+                        pass
                     job_manager_instance.job_completed(job_id)
+                    # Publish WS event to connected clients (if publisher available)
+                    try:
+                        global event_publisher
+                        if event_publisher is not None:
+                            event_publisher({"type": "job_completed", "job_id": key_id})
+                            # If no other jobs are running and the Comfy queue is empty, close WS immediately.
+                            try:
+                                import urllib.request, json as _j
+                                empty_queue = False
+                                try:
+                                    r = urllib.request.urlopen("http://127.0.0.1:8188/queue", timeout=3)
+                                    d = _j.loads(r.read().decode())
+                                    empty_queue = len(d.get("queue_pending", [])) == 0 and len(d.get("queue_running", [])) == 0
+                                except Exception:
+                                    # If queue probe fails, assume empty to prefer closing
+                                    empty_queue = True
+                                if empty_queue and len(job_manager_instance.active_jobs) == 0:
+                                    event_publisher({"type": "server_idle_close"})
+                                    # Also close sockets directly for immediate shutdown
+                                    try:
+                                        close_all_ws()
+                                    except Exception:
+                                        pass
+                            except Exception:
+                                pass
+                    except Exception:
+                        pass
                     ws.close()
                     break
                 
@@ -339,18 +716,25 @@ def _monitor_job_completion(job_id, job_manager_instance):
             print(f"[MONITOR] Monitoring timeout for job {job_id}", flush=True)
             job_manager_instance.job_completed(job_id)
             ws.close()
+            try:
+                _persist_job_state(key_id, {'status': 'error'})
+            except Exception:
+                pass
             
     except Exception as e:
         print(f"[MONITOR] Error monitoring job {job_id}: {e}", flush=True)
 
 
-def _upload_to_backblaze(video_path):
-    """Enhanced upload with zero-failure guarantee using multiple fallback strategies."""
-    return _upload_to_backblaze_enhanced(video_path)
+def _upload_to_backblaze(video_path, meta: Optional[dict] = None):
+    """Enhanced upload with zero-failure guarantee using multiple fallback strategies.
+    Returns (success: bool, public_url: Optional[str]).
+    """
+    return _upload_to_backblaze_enhanced(video_path, meta)
 
-
-def _upload_to_backblaze_enhanced(video_path):
-    """Robust upload system with comprehensive error handling and fallback strategies."""
+def _upload_to_backblaze_enhanced(video_path, meta: Optional[dict] = None):
+    """Robust upload system with comprehensive error handling and fallback strategies.
+    Returns (success: bool, public_url: Optional[str]).
+    """
     import os
     import boto3
     from botocore.config import Config
@@ -366,7 +750,7 @@ def _upload_to_backblaze_enhanced(video_path):
     video_file = Path(video_path)
     if not video_file.exists():
         print(f"[UPLOAD] Video file not found: {video_path}", flush=True)
-        return False
+        return False, None
     
     # Get configuration
     bucket = os.environ.get("S3_BUCKET")
@@ -377,7 +761,8 @@ def _upload_to_backblaze_enhanced(video_path):
     
     if not all([bucket, access_key, secret_key]):
         print("[UPLOAD] S3/Backblaze credentials not configured, using fallback storage", flush=True)
-        return _fallback_to_persistent_storage(video_file)
+        ok = _fallback_to_persistent_storage(video_file)
+        return (ok, None)
     
     # Wait for file size to stabilize and exceed a sane minimum
     MIN_VIDEO_BYTES = int(os.environ.get("MIN_VIDEO_BYTES", "4096"))
@@ -404,30 +789,33 @@ def _upload_to_backblaze_enhanced(video_path):
     print(f"[UPLOAD] Starting enhanced upload for {video_file.name} ({file_size / (1024*1024):.1f} MB) after stabilization", flush=True)
     
     # Strategy 1: Direct upload with retry logic
-    result = _upload_with_retry_logic(video_file, bucket, endpoint, access_key, secret_key, region)
-    if result:
-        return True
+    ok, key = _upload_with_retry_logic(video_file, bucket, endpoint, access_key, secret_key, region, meta)
+    if ok:
+        return True, key
     
     # Strategy 2: Multipart upload for large files
     if file_size > 100 * 1024 * 1024:  # 100MB threshold
         print(f"[UPLOAD] Attempting multipart upload for large file", flush=True)
-        result = _upload_multipart(video_file, bucket, endpoint, access_key, secret_key, region)
-        if result:
-            return True
+        ok, key = _upload_multipart(video_file, bucket, endpoint, access_key, secret_key, region, meta)
+        if ok:
+            return True, key
     
     # Strategy 3: Chunked upload with smaller parts
     print(f"[UPLOAD] Attempting chunked upload", flush=True)
-    result = _upload_chunked(video_file, bucket, endpoint, access_key, secret_key, region)
-    if result:
-        return True
+    ok, key = _upload_chunked(video_file, bucket, endpoint, access_key, secret_key, region, meta)
+    if ok:
+        return True, key
     
     # Strategy 4: Fallback to persistent storage
     print(f"[UPLOAD] All upload strategies failed, using persistent storage fallback", flush=True)
-    return _fallback_to_persistent_storage(video_file)
+    ok = _fallback_to_persistent_storage(video_file)
+    return (ok, None)
 
 
-def _upload_with_retry_logic(video_file, bucket, endpoint, access_key, secret_key, region):
-    """Upload with exponential backoff and circuit breaker pattern."""
+def _upload_with_retry_logic(video_file, bucket, endpoint, access_key, secret_key, region, meta: Optional[dict] = None):
+    """Upload with exponential backoff and circuit breaker pattern.
+    Returns (success: bool, object_key: Optional[str]).
+    """
     max_retries = 5
     base_delay = 2
     max_delay = 60
@@ -459,19 +847,20 @@ def _upload_with_retry_logic(video_file, bucket, endpoint, access_key, secret_ke
             
             # Verify upload
             if _verify_upload(s3_client, bucket, unique_key, video_file.stat().st_size):
-                # Generate public URL
-                public_url = _generate_public_url(bucket, unique_key, endpoint, region)
-                
-                # Wait for Backblaze availability
+                # Wait for Backblaze eventual consistency
                 if endpoint and "backblazeb2.com" in endpoint:
                     time.sleep(3)  # Increased wait time for Backblaze
                 
                 # Notify backend
                 project_id, user_id = _extract_ids_from_filename(video_file.name)
-                _notify_backend_upload(unique_key, public_url, video_file.name, project_id, user_id)
+                if meta:
+                    project_id = meta.get('project_id') or project_id
+                    user_id = meta.get('user_id') or user_id
+                # Public URL may not be accessible on private buckets; store key for presigning
+                _notify_backend_upload(unique_key, _generate_public_url(bucket, unique_key, endpoint, region), video_file.name, project_id, user_id)
                 
-                print(f"[UPLOAD] ✅ Successfully uploaded {video_file.name} to {public_url}", flush=True)
-                return True
+                print(f"[UPLOAD] ✅ Successfully uploaded {video_file.name} (key={unique_key})", flush=True)
+                return True, unique_key
             else:
                 # Delete bad object before retrying
                 try:
@@ -497,11 +886,13 @@ def _upload_with_retry_logic(video_file, bucket, endpoint, access_key, secret_ke
             else:
                 print(f"[UPLOAD] Unexpected error after all retries", flush=True)
     
-    return False
+    return False, None
 
 
-def _upload_multipart(video_file, bucket, endpoint, access_key, secret_key, region):
-    """Multipart upload for large files with enhanced error handling."""
+def _upload_multipart(video_file, bucket, endpoint, access_key, secret_key, region, meta: Optional[dict] = None):
+    """Multipart upload for large files with enhanced error handling.
+    Returns (success: bool, public_url: Optional[str]).
+    """
     try:
         import boto3
         from botocore.config import Config
@@ -579,21 +970,25 @@ def _upload_multipart(video_file, bucket, endpoint, access_key, secret_key, regi
         
         # Verify and notify
         if _verify_upload(s3_client, bucket, unique_key, video_file.stat().st_size):
-            public_url = _generate_public_url(bucket, unique_key, endpoint, region)
             project_id, user_id = _extract_ids_from_filename(video_file.name)
-            _notify_backend_upload(unique_key, public_url, video_file.name, project_id, user_id)
+            if meta:
+                project_id = meta.get('project_id') or project_id
+                user_id = meta.get('user_id') or user_id
+            _notify_backend_upload(unique_key, _generate_public_url(bucket, unique_key, endpoint, region), video_file.name, project_id, user_id)
             
-            print(f"[UPLOAD] ✅ Multipart upload successful for {video_file.name}", flush=True)
-            return True
+            print(f"[UPLOAD] ✅ Multipart upload successful for {video_file.name} (key={unique_key})", flush=True)
+            return True, unique_key
         
     except Exception as e:
         print(f"[UPLOAD] Multipart upload failed: {e}", flush=True)
     
-    return False
+    return False, None
 
 
-def _upload_chunked(video_file, bucket, endpoint, access_key, secret_key, region):
-    """Chunked upload with smaller parts for better reliability."""
+def _upload_chunked(video_file, bucket, endpoint, access_key, secret_key, region, meta: Optional[dict] = None):
+    """Chunked upload with smaller parts for better reliability.
+    Returns (success: bool, public_url: Optional[str]).
+    """
     try:
         import boto3
         from botocore.config import Config
@@ -629,17 +1024,19 @@ def _upload_chunked(video_file, bucket, endpoint, access_key, secret_key, region
         
         # Verify and notify
         if _verify_upload(s3_client, bucket, unique_key, file_size):
-            public_url = _generate_public_url(bucket, unique_key, endpoint, region)
             project_id, user_id = _extract_ids_from_filename(video_file.name)
-            _notify_backend_upload(unique_key, public_url, video_file.name, project_id, user_id)
+            if meta:
+                project_id = meta.get('project_id') or project_id
+                user_id = meta.get('user_id') or user_id
+            _notify_backend_upload(unique_key, _generate_public_url(bucket, unique_key, endpoint, region), video_file.name, project_id, user_id)
             
-            print(f"[UPLOAD] ✅ Chunked upload successful for {video_file.name}", flush=True)
-            return True
+            print(f"[UPLOAD] ✅ Chunked upload successful for {video_file.name} (key={unique_key})", flush=True)
+            return True, unique_key
         
     except Exception as e:
         print(f"[UPLOAD] Chunked upload failed: {e}", flush=True)
     
-    return False
+    return False, None
 
 
 def _fallback_to_persistent_storage(video_file):
@@ -818,8 +1215,8 @@ def _extract_ids_from_filename(filename):
     """Extract project and user IDs from video filename."""
     try:
         import re
-        # Format: ua{userId}_p{projectId}_...
-        match = re.search(r'ua([a-f0-9\-]+)_p([a-f0-9\-]+)_', filename)
+        # Format: u{userId}_p{projectId}_...
+        match = re.search(r'u([a-f0-9\-]+)_p([a-f0-9\-]+)_', filename)
         if match:
             return match.group(2), match.group(1)  # project_id, user_id
         return None, None
@@ -834,7 +1231,13 @@ def _notify_backend_upload(key, public_url, filename, project_id=None, user_id=N
         import os
         import re
         
-        # Extract IDs from filename if not provided (u{user}_p{project})
+        # Fill from env if not provided
+        if not project_id:
+            project_id = os.environ.get("GAUSIAN_PROJECT_ID") or os.environ.get("PROJECT_ID")
+        if not user_id:
+            user_id = os.environ.get("GAUSIAN_USER_ID") or os.environ.get("USER_ID")
+
+        # Extract IDs from filename if still not provided (u{user}_p{project})
         if not project_id or not user_id:
             match = re.search(r'u([a-f0-9\-]+)_p([a-f0-9\-]+)_', filename)
             if match:
@@ -857,7 +1260,7 @@ def _notify_backend_upload(key, public_url, filename, project_id=None, user_id=N
         }
         
         response = requests.post(
-            f"{backend_url}/api/modal-upload",
+            f"{backend_url}/api/media/modal-upload",
             json=payload,
             timeout=10
         )
@@ -950,20 +1353,12 @@ image = (
     },
     timeout=21600,
     min_containers=0,
-    max_containers=2,
+    max_containers=1,
     scaledown_window=900,
-    secrets=[
-        modal.Secret.from_dict({
-            "S3_BUCKET": os.environ.get("S3_BUCKET", ""),
-            "S3_REGION": os.environ.get("S3_REGION", "us-east-1"),
-            "S3_ENDPOINT": os.environ.get("S3_ENDPOINT", ""),
-            "AWS_ACCESS_KEY_ID": os.environ.get("AWS_ACCESS_KEY_ID", ""),
-            "AWS_SECRET_ACCESS_KEY": os.environ.get("AWS_SECRET_ACCESS_KEY", ""),
-            "BACKEND_URL": os.environ.get("BACKEND_URL", "http://localhost:3001"),
-        })
-    ],
+    secrets=[modal.Secret.from_name("cloud-config")],
     
 )
+@modal.concurrent(max_inputs=64)
 @modal.asgi_app()
 def comfyui():
     """
@@ -1072,7 +1467,10 @@ def comfyui():
             self.active_jobs = set()
             self.completed_jobs = set()
             self.uploaded_videos = set()  # Track uploaded videos to prevent duplicates
+            self.uploads_in_progress = 0   # Prevent shutdown while uploads are running
             self.last_activity = time.time()
+            self.ws_clients = 0  # Number of connected WS clients
+            self.server_ready = False  # Gate shutdown until Comfy is ready
             self._start_shutdown_monitor()
         
         def _start_shutdown_monitor(self):
@@ -1080,28 +1478,28 @@ def comfyui():
             def shutdown_monitor():
                 while True:
                     try:
-                        time.sleep(15)  # Check every 15 seconds
-                        
-                        # Only shutdown if truly idle - no active jobs AND no recent activity
-                        idle_time = time.time() - self.last_activity
-                        
-                        if (len(self.active_jobs) == 0 and idle_time > 20):
-                            print(f"[SHUTDOWN] No active jobs for {idle_time:.1f} seconds, initiating shutdown", flush=True)
-                            print("[SHUTDOWN] Container will terminate to save costs", flush=True)
-                            
-                            # Graceful shutdown
+                        time.sleep(3)  # Check every 3 seconds
+
+                        # Do not consider shutdown until server is fully ready
+                        if not self.server_ready:
+                            continue
+
+                        # Tight shutdown: as soon as no active jobs AND no WS clients, exit
+                        if len(self.active_jobs) == 0 and self.ws_clients == 0 and self.uploads_in_progress == 0:
+                            print("[SHUTDOWN] No active jobs, no WS clients, no uploads — shutting down now", flush=True)
                             os._exit(0)
-                        elif len(self.active_jobs) > 0:
-                            print(f"[SHUTDOWN] Still active: {len(self.active_jobs)} jobs running", flush=True)
+                        elif len(self.active_jobs) > 0 or self.uploads_in_progress > 0:
+                            print(f"[SHUTDOWN] Still active: jobs={len(self.active_jobs)} uploads={self.uploads_in_progress} (ws_clients={self.ws_clients})", flush=True)
                         else:
-                            print(f"[SHUTDOWN] Idle for {idle_time:.1f}s, waiting for 20s threshold", flush=True)
-                            
+                            idle_time = time.time() - self.last_activity
+                            print(f"[SHUTDOWN] Awaiting WS disconnects (ws_clients={self.ws_clients}) idle={idle_time:.1f}s", flush=True)
+                        
                     except Exception as e:
                         print(f"[SHUTDOWN] Shutdown monitor error: {e}", flush=True)
             
             self.shutdown_thread = threading.Thread(target=shutdown_monitor, daemon=True)
             self.shutdown_thread.start()
-            print("[SHUTDOWN] Auto-shutdown monitor started (30-second idle timeout)", flush=True)
+            print("[SHUTDOWN] Auto-shutdown monitor started (3-second loop, immediate when ws=0 & jobs=0)", flush=True)
         
         def job_started(self, job_id):
             """Mark a job as started."""
@@ -1120,15 +1518,41 @@ def comfyui():
             # If no more active jobs, start shutdown timer
             if not self.active_jobs:
                 print("[JOBS] All jobs completed, shutdown timer active", flush=True)
+
+        def set_ws_clients(self, n: int):
+            try:
+                self.ws_clients = max(0, int(n))
+            except Exception:
+                self.ws_clients = 0
+            self.last_activity = time.time()
+
+        def mark_ready(self):
+            # Called once ComfyUI is up and serving
+            self.server_ready = True
+            self.last_activity = time.time()
+
+        def upload_started(self):
+            try:
+                self.uploads_in_progress += 1
+                if self.uploads_in_progress < 0:
+                    self.uploads_in_progress = 0
+            except Exception:
+                self.uploads_in_progress = max(1, getattr(self, 'uploads_in_progress', 0))
+            self.last_activity = time.time()
+
+        def upload_finished(self):
+            try:
+                self.uploads_in_progress -= 1
+                if self.uploads_in_progress < 0:
+                    self.uploads_in_progress = 0
+            except Exception:
+                self.uploads_in_progress = 0
+            self.last_activity = time.time()
     
     # Initialize job manager
     job_manager = JobCompletionManager()
     
-    # Global progress tracking for WebSocket data
-    global_progress = {
-        'jobs': {},  # job_id -> progress_data
-        'last_update': time.time()
-    }
+    # Use module-level global_progress (avoid rebinding a local)
     
     # Add global completion checker
     def global_completion_checker(job_manager_instance):
@@ -1143,9 +1567,9 @@ def comfyui():
             try:
                 time.sleep(10)  # Check every 10 seconds
                 
-                # Count videos in output directory
+                # Count videos in output directory (recursive)
                 output_dir = Path("/outputs")
-                current_videos = list(output_dir.glob("*.mp4"))
+                current_videos = list(output_dir.rglob("*.mp4"))
                 current_count = len(current_videos)
                 
                 print(f"[GLOBAL-CHECK] Video count: {current_count}, Active jobs: {len(job_manager_instance.active_jobs)}", flush=True)
@@ -1161,8 +1585,14 @@ def comfyui():
                             # Add to uploaded set BEFORE uploading to prevent race conditions
                             job_manager_instance.uploaded_videos.add(video.name)
                             print(f"[GLOBAL-CHECK] Uploading new video: {video.name}", flush=True)
-                            success = _upload_to_backblaze(str(video))
-                            if not success:
+                            ok, key = _upload_to_backblaze(str(video))
+                            if ok and key:
+                                try:
+                                    # We don't know the job_id here; leave key caching to the per-job monitor
+                                    pass
+                                except Exception:
+                                    pass
+                            if not ok:
                                 # Remove from set if upload failed
                                 job_manager_instance.uploaded_videos.discard(video.name)
                     
@@ -1171,20 +1601,58 @@ def comfyui():
                 else:
                     stable_count += 1
                 
-                # Only shutdown if truly idle - check ComfyUI queue status too
-                if len(job_manager_instance.active_jobs) == 0 and stable_count >= 6:  # 20 seconds stable
+                # Only shutdown if truly idle - check ComfyUI queue status too,
+                # and allow a grace period for the desktop app to download artifacts.
+                if len(job_manager_instance.active_jobs) == 0 and stable_count >= 6:  # ~60s stable (@10s interval)
                     try:
                         # Double-check ComfyUI queue is actually empty
                         queue_response = urllib.request.urlopen(f"http://127.0.0.1:8188/queue", timeout=5)
                         queue_data = json.loads(queue_response.read().decode())
-                        
                         queue_pending = queue_data.get("queue_pending", [])
                         queue_running = queue_data.get("queue_running", [])
-                        
+
                         if len(queue_pending) == 0 and len(queue_running) == 0:
-                            print("[GLOBAL-CHECK] All jobs complete, queue empty, and stable - triggering shutdown", flush=True)
-                            print("[SHUTDOWN] Container terminating immediately to save costs", flush=True)
-                            os._exit(0)
+                            # Do not shut down if any persisted job indicates running recently
+                            try:
+                                import json as _j
+                                active_persisted = False
+                                now_ts = time.time()
+                                for jf in _jobs_dir().glob("*.json"):
+                                    try:
+                                        st = _j.loads(jf.read_text(encoding="utf-8"))
+                                    except Exception:
+                                        continue
+                                    if st.get('status') == 'running' and (now_ts - float(st.get('updated_at', now_ts))) < 600:
+                                        active_persisted = True
+                                        break
+                                if active_persisted:
+                                    print("[GLOBAL-CHECK] Persisted running jobs present; skipping shutdown", flush=True)
+                                    stable_count = 0
+                                    continue
+                            except Exception:
+                                pass
+                            # Enforce a download grace window
+                            GRACE = float(os.environ.get("SHUTDOWN_GRACE_SECONDS", "60"))
+                            now = time.time()
+                            ready = True
+                            # For each completed job: consider ready if ACKed, or if all artifacts were downloaded, or grace elapsed
+                            for jid, when in list(job_completed_at.items()):
+                                if jid in jobs_imported_ack:
+                                    continue
+                                arts = job_artifacts.get(jid, [])
+                                for name in arts:
+                                    if name not in downloads_seen and (now - when) < GRACE:
+                                        ready = False
+                                        break
+                                if not ready:
+                                    break
+                            if ready:
+                                print("[GLOBAL-CHECK] All jobs complete, queue empty, grace satisfied - shutdown", flush=True)
+                                print("[SHUTDOWN] Container terminating to save costs", flush=True)
+                                os._exit(0)
+                            else:
+                                remain = int(max(0.0, GRACE - min((now - t) for t in job_completed_at.values()))) if job_completed_at else 0
+                                print(f"[GLOBAL-CHECK] Waiting for downloads/grace (~{remain}s left)", flush=True)
                         else:
                             print(f"[GLOBAL-CHECK] Queue not empty - Pending: {len(queue_pending)}, Running: {len(queue_running)}", flush=True)
                             stable_count = 0  # Reset stability counter if queue has items
@@ -1210,12 +1678,130 @@ def comfyui():
         finally:
             proc.terminate()
         raise
+    # Mark server ready so the shutdown monitor may start enforcing rules
+    try:
+        job_manager.mark_ready()
+        print("[READY] ComfyUI ready; shutdown monitor armed", flush=True)
+    except Exception:
+        pass
 
     # Build the FastAPI proxy app (served by Modal)
-    from fastapi import FastAPI, Request, Response
+    from fastapi import FastAPI, Request, Response, WebSocket
     import httpx
 
     api = FastAPI()
+    # Lightweight in-app event bus for job notifications
+    import asyncio, json as _json
+    loop = asyncio.get_event_loop()
+    clients: set[asyncio.Queue] = set()
+    ws_sockets: set[WebSocket] = set()
+
+    def broadcast(event: dict):
+        for q in list(clients):
+            try:
+                loop.call_soon_threadsafe(q.put_nowait, event)
+            except Exception:
+                pass
+
+    def close_all_ws():
+        try:
+            for s in list(ws_sockets):
+                try:
+                    loop.call_soon_threadsafe(asyncio.create_task, s.close())
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    # Expose publisher to background threads
+    def _publish(ev: dict):
+        try:
+            broadcast(ev)
+        except Exception:
+            pass
+    global event_publisher
+    event_publisher = _publish
+
+    # Background status broadcaster: sends queue + summary every ~2 seconds
+    def _start_status_broadcast():
+        import threading, urllib.request
+        def worker():
+            last_idle_close = 0.0
+            while True:
+                try:
+                    qd = {"queue_pending": 0, "queue_running": 0}
+                    try:
+                        r = urllib.request.urlopen("http://127.0.0.1:8188/queue", timeout=3)
+                        import json as _j
+                        d = _j.loads(r.read().decode())
+                        qd["queue_pending"] = len(d.get("queue_pending", []))
+                        qd["queue_running"] = len(d.get("queue_running", []))
+                    except Exception:
+                        pass
+                    # Summarize in-progress jobs from global_progress
+                    jobs = []
+                    try:
+                        for jid, p in list(global_progress.get('jobs', {}).items()):
+                            jobs.append({
+                                "job_id": jid,
+                                "progress_percent": p.get('progress_percent', 0),
+                                "current_step": p.get('current_step', 0),
+                                "total_steps": p.get('total_steps', 0),
+                            })
+                    except Exception:
+                        pass
+                    # Merge persisted jobs (avoid duplicates)
+                    try:
+                        seen = {it.get("job_id") for it in jobs}
+                        for jf in sorted(_jobs_dir().glob("*.json")):
+                            try:
+                                import json as _j
+                                st = _j.loads(jf.read_text(encoding="utf-8"))
+                            except Exception:
+                                continue
+                            jid = st.get('id') or jf.stem
+                            if jid in seen:
+                                continue
+                            jobs.append({
+                                "job_id": jid,
+                                "progress_percent": st.get('progress_percent'),
+                                "current_step": st.get('current_step'),
+                                "total_steps": st.get('total_steps'),
+                            })
+                    except Exception:
+                        pass
+                    _publish({"type": "status", "pending": qd["queue_pending"], "running": qd["queue_running"], "jobs": jobs})
+
+                    # Proactively close idle WS connections when no jobs are active or pending
+                    try:
+                        import json as _j, time as _t
+                        if qd["queue_pending"] == 0 and qd["queue_running"] == 0:
+                            # Any persisted running job in the last 2 minutes?
+                            now_ts = _t.time()
+                            active_persisted = False
+                            for jf in _jobs_dir().glob("*.json"):
+                                try:
+                                    st = _j.loads(jf.read_text(encoding="utf-8"))
+                                except Exception:
+                                    continue
+                                if st.get('status') == 'running' and (now_ts - float(st.get('updated_at', now_ts))) < 20:
+                                    active_persisted = True
+                                    break
+                            if not active_persisted and (now_ts - last_idle_close) > 30:
+                                _publish({"type": "server_idle_close"})
+                                try:
+                                    close_all_ws()
+                                except Exception:
+                                    pass
+                                last_idle_close = now_ts
+                    except Exception:
+                        pass
+                except Exception:
+                    pass
+                finally:
+                    time.sleep(2.0)
+        threading.Thread(target=worker, daemon=True).start()
+    _start_status_broadcast()
     from fastapi.staticfiles import StaticFiles
     api.mount("/files", StaticFiles(directory="/outputs"), name="files")
     COMFY = "http://127.0.0.1:8188"
@@ -1223,6 +1809,55 @@ def comfyui():
     @api.get("/")
     async def root():
         return {"ok": True, "msg": "ComfyUI proxy up. Try /health or /system_stats."}
+
+    @api.get("/healthz")
+    async def healthz(request: Request):
+        from pathlib import Path
+        base = str(request.base_url).rstrip("/")
+        outs = []
+        try:
+            for f in sorted(Path("/outputs").glob("*.mp4"), key=lambda p: p.stat().st_mtime, reverse=True)[:10]:
+                name = f.name
+                url = f"{base}/view?filename={name}"
+                outs.append({"filename": name, "url": url})
+        except Exception:
+            pass
+        ws = base.replace("https://", "wss://", 1).replace("http://", "ws://", 1) + "/events"
+        return {"ok": True, "http": base, "ws": ws, "recent": [{"id": "outputs", "status": "completed", "artifacts": outs}]}
+
+    @api.websocket("/events")
+    async def ws_events(ws: WebSocket):
+        await ws.accept()
+        q: asyncio.Queue = asyncio.Queue()
+        clients.add(q)
+        ws_sockets.add(ws)
+        try:
+            job_manager.set_ws_clients(len(ws_sockets))
+        except Exception:
+            pass
+        try:
+            await ws.send_text(_json.dumps({"type": "hello"}))
+            while True:
+                ev = await q.get()
+                await ws.send_text(_json.dumps(ev))
+                try:
+                    if isinstance(ev, dict) and ev.get("type") == "server_idle_close":
+                        await ws.close()
+                        break
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        finally:
+            clients.discard(q)
+            try:
+                ws_sockets.discard(ws)
+            except Exception:
+                pass
+            try:
+                job_manager.set_ws_clients(len(ws_sockets))
+            except Exception:
+                pass
     
     @api.get("/progress-status")
     async def progress_status():
@@ -1272,6 +1907,11 @@ def comfyui():
             
             overall_progress = total_progress / max(1, active_jobs_count) if active_jobs_count > 0 else 100
             
+            # Determine service active state (avoid waking cold containers unnecessarily)
+            now_ts = time.time()
+            any_active = (len(queue_pending) + len(queue_running) + len(job_manager.active_jobs)) > 0
+            # Completed jobs list
+            completed_list = list(job_manager.completed_jobs)
             return {
                 "active_jobs": active_jobs_count,
                 "uploaded_videos": len(job_manager.uploaded_videos),
@@ -1282,9 +1922,11 @@ def comfyui():
                 "overall_progress": round(overall_progress, 1),
                 "total_jobs_submitted": total_jobs_submitted,
                 "last_activity": job_manager.last_activity,
-                "idle_time": time.time() - job_manager.last_activity,
-                "recent_jobs": list(job_manager.completed_jobs)[-10:],
-                "job_details": job_details,
+                "idle_time": now_ts - job_manager.last_activity,
+                "recent_jobs": completed_list[-10:],
+                "job_details": [dict(it, **{"completed": False}) for it in job_details],
+                "completed_jobs": completed_list,
+                "active": any_active,
                 "estimated_time_per_shot": "15-67 seconds",
                 "websocket_progress": True,
             }
@@ -1329,7 +1971,22 @@ def comfyui():
         print(f"[DEBUG] Tracking job with ID: {job_id}", flush=True)
         job_manager.job_started(job_id)
 
+        # Accept either a full request {prompt: {...}} or a raw graph map as body
         p = req.get("prompt", None)
+        revived_graph = False
+        if p is None and isinstance(req, dict):
+            # Heuristic: if body looks like a graph (values with class_type/inputs), wrap it
+            try:
+                looks_like_graph = False
+                for v in list(req.values())[:5]:
+                    if isinstance(v, dict) and ("class_type" in v or "inputs" in v):
+                        looks_like_graph = True
+                        break
+                if looks_like_graph:
+                    req["prompt"] = p = req
+                    revived_graph = True
+            except Exception:
+                pass
         if p is None:
             return Response(
                 content=json.dumps({"error": "Missing 'prompt' in body"}),
@@ -1387,8 +2044,8 @@ def comfyui():
             if "class_type" not in v or "inputs" not in v or not isinstance(v["inputs"], dict):
                 missing.append(k)
 
-        if revived_top or revived_nodes:
-            print(f"[PROXY] revived_top={revived_top} revived_nodes={revived_nodes}", flush=True)
+        if revived_top or revived_nodes or revived_graph:
+            print(f"[PROXY] revived_top={revived_top} revived_graph={revived_graph} revived_nodes={revived_nodes}", flush=True)
 
         if bad_nodes or missing:
             err = {
@@ -1398,15 +2055,165 @@ def comfyui():
             }
             return Response(content=json.dumps(err), status_code=400, media_type="application/json")
 
+        # Build an execution plan: sum steps across samplers and count encode nodes
+        def _resolve_int_from_input(graph: dict, spec):
+            try:
+                if isinstance(spec, int):
+                    return spec
+                if isinstance(spec, (float,)):
+                    return int(spec)
+                if isinstance(spec, list) and len(spec) >= 1 and isinstance(spec[0], str):
+                    ref = graph.get(spec[0])
+                    if isinstance(ref, dict):
+                        ct = ref.get('class_type')
+                        inputs = ref.get('inputs') or {}
+                        if ct in ('PrimitiveInt', 'PrimitiveInteger', 'Int'):
+                            val = inputs.get('value')
+                            if isinstance(val, int):
+                                return val
+                        if ct in ('SimpleMath+', 'SimpleMath'):
+                            expr = inputs.get('value')
+                            if isinstance(expr, str):
+                                vals = {}
+                                for k2, v2 in inputs.items():
+                                    if k2 == 'value':
+                                        continue
+                                    vi = _resolve_int_from_input(graph, v2)
+                                    if isinstance(vi, int):
+                                        vals[k2] = vi
+                                try:
+                                    return int(eval(expr, {}, vals))
+                                except Exception:
+                                    return None
+                return None
+            except Exception:
+                return None
+
+        def _build_plan(graph: dict):
+            weights = {}
+            encode_nodes = []
+            # Try to infer per-video frame count from graph
+            def _collect_lengths() -> list[int]:
+                lens: list[int] = []
+                try:
+                    for nid, node in graph.items():
+                        if not isinstance(node, dict):
+                            continue
+                        ct = node.get('class_type')
+                        ins = node.get('inputs') or {}
+                        # Primary: EmptyHunyuanLatentVideo.length
+                        if ct in ('EmptyHunyuanLatentVideo', 'EmptyLatentVideo'):
+                            ln = _resolve_int_from_input(graph, ins.get('length'))
+                            if isinstance(ln, int) and ln > 0:
+                                lens.append(ln)
+                        # Generic: any node with a numeric 'length' input
+                        if 'length' in ins:
+                            ln2 = _resolve_int_from_input(graph, ins.get('length'))
+                            if isinstance(ln2, int) and ln2 > 0:
+                                lens.append(ln2)
+                except Exception:
+                    pass
+                return lens
+
+            lengths = _collect_lengths()
+            frames_per_video = max(lengths) if lengths else 1
+            for nid, node in graph.items():
+                if not isinstance(node, dict):
+                    continue
+                ct = node.get('class_type')
+                if ct in ('KSampler', 'KSamplerAdvanced'):
+                    st = _resolve_int_from_input(graph, (node.get('inputs') or {}).get('steps'))
+                    if isinstance(st, int) and st > 0:
+                        weights[str(nid)] = st
+                if ct in ('VHS_VideoCombine', 'VideoCombine', 'SaveVideo'):
+                    encode_nodes.append(str(nid))
+            encode_weights = {eid: frames_per_video for eid in encode_nodes}
+            total = sum(weights.values()) + sum(encode_weights.values())
+            return {"weights": weights, "encode_weights": encode_weights, "total_steps": total, "frames": frames_per_video}
+
+        plan = _build_plan(p)
+
+        # Capture/ensure filename prefix from graph for artifact filtering/uniqueness
+        try:
+            expect_prefix = None
+            for _nid, node in (p or {}).items():
+                if not isinstance(node, dict):
+                    continue
+                ct = node.get('class_type')
+                if ct in ('VHS_VideoCombine', 'VideoCombine', 'SaveVideo', 'SaveImage'):
+                    ins = node.get('inputs') or {}
+                    fp = ins.get('filename_prefix')
+                    if isinstance(fp, str) and fp.strip():
+                        expect_prefix = fp.strip()
+                        break
+            if not expect_prefix:
+                # Default to client-provided id to avoid cross-job collisions
+                expect_prefix = str(job_id)
+                # Patch the graph inline to ensure downstream filenames are prefixed uniquely
+                for _nid, node in (p or {}).items():
+                    if not isinstance(node, dict):
+                        continue
+                    ct = node.get('class_type')
+                    if ct in ('VHS_VideoCombine', 'VideoCombine', 'SaveVideo', 'SaveImage'):
+                        if not isinstance(node.get('inputs'), dict):
+                            node['inputs'] = {}
+                        if not node['inputs'].get('filename_prefix'):
+                            node['inputs']['filename_prefix'] = expect_prefix
+                # Save patched prompt back into request body
+                req['prompt'] = p
+            if expect_prefix:
+                job_prefixes[str(job_id)] = expect_prefix
+        except Exception:
+            pass
+
+        # Capture job meta for later upload/notify (project/user)
+        try:
+            candidate_project = req.get('project_id') if isinstance(req, dict) else None
+            candidate_user = req.get('user_id') if isinstance(req, dict) else None
+        except Exception:
+            candidate_project = None
+            candidate_user = None
+
         # Forward to local ComfyUI
         async with httpx.AsyncClient(timeout=60) as client:
             r = await client.post(f"{COMFY}/prompt", json=req)
-        
+
         # Start monitoring for job completion and upload
         if r.status_code == 200:
+            # extract prompt_id from Comfy response
+            pid_val = None
+            try:
+                d = r.json()
+                pid_val = d.get("prompt_id") or d.get("number") or d.get("id")
+            except Exception:
+                pid_val = None
+            # Record meta and prefix for both prompt and client ids
+            try:
+                if pid_val is not None:
+                    job_meta[str(pid_val)] = {"project_id": candidate_project, "user_id": candidate_user}
+                    # Propagate expected prefix to prompt_id key as well
+                    if job_prefixes.get(str(job_id)):
+                        job_prefixes[str(pid_val)] = job_prefixes.get(str(job_id))
+                if job_id:
+                    job_meta[str(job_id)] = {"project_id": candidate_project, "user_id": candidate_user}
+            except Exception:
+                pass
+            # Persist initial running state with computed total steps for cross-request visibility
+            try:
+                if pid_val is not None:
+                    norm_total = int(plan.get('frames') or plan.get('total_steps') or 0)
+                    _persist_job_state(str(pid_val), {
+                        'status': 'running',
+                        'current_step': 0,
+                        'total_steps': norm_total,
+                        'progress_percent': 0,
+                        'artifacts': [],
+                    })
+            except Exception:
+                pass
             threading.Thread(
                 target=_monitor_job_completion,
-                args=(job_id, job_manager),
+                args=(job_id, pid_val, job_manager, plan),
                 daemon=True
             ).start()
         
@@ -1441,16 +2248,23 @@ def comfyui():
 
     @api.get("/view")
     async def view(filename: str):
-        """Serve generated files from the outputs directory"""
+        """Serve generated files from the outputs directory (streaming).
+        We stream in chunks and only mark download as seen on successful completion
+        to avoid premature shutdown during long transfers.
+        """
         import os
         from pathlib import Path
-        
-        # Look for the file in the outputs directory
-        file_path = Path("/outputs") / filename
-        
-        if not file_path.exists():
+        from fastapi.responses import StreamingResponse
+        base = Path("/outputs").resolve()
+        file_path = (base / filename).resolve()
+        # Prevent path traversal
+        try:
+            _ = file_path.relative_to(base)
+        except Exception:
+            return {"error": "Invalid path"}, 400
+        if not file_path.exists() or not file_path.is_file():
             return {"error": f"File {filename} not found"}, 404
-        
+
         # Determine content type based on file extension
         content_type = "application/octet-stream"
         if filename.endswith(".mp4"):
@@ -1461,14 +2275,129 @@ def comfyui():
             content_type = "image/jpeg"
         elif filename.endswith(".gif"):
             content_type = "image/gif"
-        
-        # Read and return the file
+
+        def file_iterator(path: Path, chunk_size: int = 1024 * 1024):
+            try:
+                with open(path, "rb") as f:
+                    while True:
+                        chunk = f.read(chunk_size)
+                        if not chunk:
+                            break
+                        # Touch last_activity to avoid idle shutdown while streaming
+                        try:
+                            job_manager.last_activity = time.time()
+                        except Exception:
+                            pass
+                        yield chunk
+                # Mark as downloaded after successful streaming
+                try:
+                    downloads_seen.add(filename)
+                except Exception:
+                    pass
+            except Exception:
+                # Do not mark as downloaded on error
+                raise
+
+        return StreamingResponse(file_iterator(file_path), media_type=content_type)
+
+    @api.get("/jobs/{job_id}")
+    async def get_job(job_id: str, request: Request):
+        """Return job status/artifacts from persistent state, with in-memory fallback."""
+        import json as _j
+        base = str(request.base_url).rstrip("/")
+        # Prefer persisted state keyed by job_id; callers should pass the prompt_id
+        state = _read_job_state(job_id) or {}
+        status = state.get('status') or 'unknown'
+        cur = state.get('current_step')
+        tot = state.get('total_steps')
+        pr = state.get('progress_percent')
+        names = state.get('artifacts') or []
+        # Fallback to memory if no persisted artifacts
+        if not names:
+            names = job_artifacts.get(job_id, [])
+        arts = []
+        for name in names:
+            if not isinstance(name, str) or not name:
+                continue
+            # Prefer presigned S3 URL if we have an object key
+            url = None
+            try:
+                key = (job_object_keys.get(job_id) or {}).get(name)
+            except Exception:
+                key = None
+            if key:
+                try:
+                    import boto3
+                    expire = int(os.environ.get("ARTIFACT_URL_EXPIRE", "86400"))
+                    region = os.environ.get("S3_REGION") or os.environ.get("AWS_REGION")
+                    endpoint = os.environ.get("S3_ENDPOINT")
+                    bucket = os.environ.get("S3_BUCKET")
+                    s3 = boto3.client("s3", region_name=region, endpoint_url=endpoint) if endpoint else boto3.client("s3", region_name=region)
+                    url = s3.generate_presigned_url("get_object", Params={"Bucket": bucket, "Key": key}, ExpiresIn=expire)
+                except Exception:
+                    url = None
+            if not url:
+                url = f"{base}/view?filename={name}"
+            arts.append({"filename": name, "url": url})
+        # If completed but no artifact list, try scanning outputs directory for recent files
+        if status == 'completed' and not arts:
+            try:
+                from pathlib import Path as _P
+                for f in sorted(_P("/outputs").glob("*.mp4"), key=lambda p: p.stat().st_mtime, reverse=True)[:3]:
+                    arts.append({"filename": f.name, "url": f"{base}/view?filename={f.name}"})
+            except Exception:
+                pass
+        resp = {"id": job_id, "status": status, "artifacts": arts}
+        if pr is not None:
+            resp["progress_percent"] = pr
+        if cur is not None:
+            resp["current_step"] = cur
+        if tot is not None:
+            resp["total_steps"] = tot
+        return resp
+
+    @api.post("/jobs/{job_id}/imported")
+    async def mark_imported(job_id: str, request: Request):
+        """Client signals it finished importing artifacts.
+        Optional JSON body may include {"filenames": ["..."]} to mark specific files as downloaded.
+        Accepts either X-Shared-Secret or Bearer token matching SHARED_SECRET.
+        """
         try:
-            with open(file_path, "rb") as f:
-                content = f.read()
-            return Response(content=content, media_type=content_type)
-        except Exception as e:
-            return {"error": f"Error reading file: {str(e)}"}, 500
+            # Auth (best-effort; allow unauth if no secret configured)
+            ok = True
+            if SHARED_SECRET and SHARED_SECRET != "change-me":
+                ok = (request.headers.get("x-shared-secret") == SHARED_SECRET)
+                if not ok:
+                    auth = request.headers.get("authorization") or ""
+                    if auth.lower().startswith("bearer ") and auth.split(" ", 1)[1].strip() == SHARED_SECRET:
+                        ok = True
+            if not ok:
+                return Response(status_code=401)
+            # Mark ACK
+            try:
+                jobs_imported_ack.add(str(job_id))
+            except Exception:
+                pass
+            # Optionally mark specific files as downloaded
+            try:
+                data = await request.json()
+            except Exception:
+                data = {}
+            try:
+                files = data.get("filenames") or []
+                for name in files:
+                    if isinstance(name, str) and name:
+                        downloads_seen.add(name)
+            except Exception:
+                pass
+            # Keep container warm briefly
+            try:
+                job_manager.last_activity = time.time()
+            except Exception:
+                pass
+            return {"ok": True}
+        except Exception:
+            return Response(status_code=500)
 
     @api.get("/debug/models")
     async def debug_models():

@@ -34,6 +34,11 @@ symphonia = { version = "0.5", features = ["aac", "flac", "vorbis", "mp3", "wav"
 webbrowser = "0.8"
 walkdir = "2"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
+ureq = { version = "2" }
+tungstenite = { version = "0.21", default-features = true }
+url = "2"
+urlencoding = "2"
+http = "1"
 
 [features]
 unsafe-interop = []
