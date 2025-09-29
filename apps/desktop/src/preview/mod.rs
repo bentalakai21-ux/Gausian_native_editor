@@ -19,9 +19,15 @@ pub(crate) fn visual_source_at(graph: &TimelineGraph, playhead: i64) -> Option<V
         }
         for node_id in binding.node_ids.iter() {
             // Skip missing nodes instead of aborting the entire search.
-            let Some(node) = graph.nodes.get(node_id) else { continue };
-            let Some(range) = node_frame_range(node) else { continue };
-            if playhead < range.start || playhead >= range.end() { continue; }
+            let Some(node) = graph.nodes.get(node_id) else {
+                continue;
+            };
+            let Some(range) = node_frame_range(node) else {
+                continue;
+            };
+            if playhead < range.start || playhead >= range.end() {
+                continue;
+            }
             match &node.kind {
                 TimelineNodeKind::Clip(clip) => {
                     let asset = clip.asset_id.as_deref().unwrap_or("<unknown>");
@@ -30,8 +36,14 @@ pub(crate) fn visual_source_at(graph: &TimelineGraph, playhead: i64) -> Option<V
                         return Some(src);
                     }
                 }
-                TimelineNodeKind::Generator { generator_id, metadata, .. } => {
-                    if let Some(src) = generator_source(generator_id, metadata) { return Some(src); }
+                TimelineNodeKind::Generator {
+                    generator_id,
+                    metadata,
+                    ..
+                } => {
+                    if let Some(src) = generator_source(generator_id, metadata) {
+                        return Some(src);
+                    }
                 }
                 _ => {}
             }
@@ -54,15 +66,17 @@ fn clip_source(binding: &timeline_crate::TrackBinding, clip: &ClipNode) -> Optio
     let ext_is_image = std::path::Path::new(&path)
         .extension()
         .and_then(|e| e.to_str())
-        .map(|s| s.eq_ignore_ascii_case("png")
-            || s.eq_ignore_ascii_case("jpg")
-            || s.eq_ignore_ascii_case("jpeg")
-            || s.eq_ignore_ascii_case("gif")
-            || s.eq_ignore_ascii_case("webp")
-            || s.eq_ignore_ascii_case("bmp")
-            || s.eq_ignore_ascii_case("tif")
-            || s.eq_ignore_ascii_case("tiff")
-            || s.eq_ignore_ascii_case("exr"))
+        .map(|s| {
+            s.eq_ignore_ascii_case("png")
+                || s.eq_ignore_ascii_case("jpg")
+                || s.eq_ignore_ascii_case("jpeg")
+                || s.eq_ignore_ascii_case("gif")
+                || s.eq_ignore_ascii_case("webp")
+                || s.eq_ignore_ascii_case("bmp")
+                || s.eq_ignore_ascii_case("tif")
+                || s.eq_ignore_ascii_case("tiff")
+                || s.eq_ignore_ascii_case("exr")
+        })
         .unwrap_or(false);
     let track_hint_image = matches!(binding.kind, TrackKind::Custom(ref id) if id == "image");
     let is_image = ext_is_image || track_hint_image;

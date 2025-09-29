@@ -4,10 +4,32 @@ use crate::decode::{DecodeCmd, FramePayload, PlayState};
 use crate::preview::state::upload_plane;
 use crate::preview::{visual_source_at, PreviewShaderMode, PreviewState, StreamMetadata};
 use crate::App;
+use image::GenericImageView;
 use renderer::{
     convert_yuv_to_rgba, ColorSpace as RenderColorSpace, PixelFormat as RenderPixelFormat,
 };
 use tracing::trace;
+
+fn fit_rect_to_content(rect: egui::Rect, content_w: f32, content_h: f32) -> egui::Rect {
+    if content_w <= 0.0 || content_h <= 0.0 {
+        return rect;
+    }
+    let rect_size = rect.size();
+    if rect_size.x <= 0.0 || rect_size.y <= 0.0 {
+        return rect;
+    }
+    let content_aspect = content_w / content_h;
+    let rect_aspect = rect_size.x / rect_size.y;
+    let (width, height) = if rect_aspect > content_aspect {
+        let height = rect_size.y;
+        (height * content_aspect, height)
+    } else {
+        let width = rect_size.x;
+        (width, width / content_aspect)
+    };
+    let size = egui::vec2(width, height);
+    egui::Rect::from_center_size(rect.center(), size)
+}
 
 impl App {
     pub(crate) fn preview_ui(
@@ -96,6 +118,10 @@ impl App {
         let painter = ui.painter_at(rect);
         painter.rect_filled(rect, 4.0, egui::Color32::from_rgb(12, 12, 12));
 
+        if matches!(self.engine.state, PlayState::Playing) {
+            self.last_seek_request_at = None;
+        }
+
         // Use persistent decoder with prefetch
         // Solid/text generators fallback
         if let Some(src) = source.as_ref() {
@@ -144,18 +170,34 @@ impl App {
         if src.is_image {
             // Load or refresh texture when source or size changes
             let need_reload = match self.preview.current_source.as_ref() {
-                Some(prev) => prev.path != src.path || self.preview.last_size != (w as u32, h as u32),
+                Some(prev) => {
+                    prev.path != src.path || self.preview.last_size != (w as u32, h as u32)
+                }
                 None => true,
             };
             if need_reload {
                 match image::open(&src.path) {
-                    Ok(img) => {
-                        let resized = img.resize(w as u32, h as u32, image::imageops::FilterType::Lanczos3);
-                        let rgba = resized.to_rgba8();
-                        let (iw, ih) = rgba.dimensions();
+                    Ok(mut img) => {
+                        let (orig_w, orig_h) = img.dimensions();
+                        let fitted = fit_rect_to_content(rect, orig_w as f32, orig_h as f32);
+                        let target_w = fitted.width().max(1.0).round() as u32;
+                        let target_h = fitted.height().max(1.0).round() as u32;
+                        if (target_w, target_h) != (orig_w, orig_h) {
+                            img = img.resize_exact(
+                                target_w,
+                                target_h,
+                                image::imageops::FilterType::Lanczos3,
+                            );
+                        }
+                        let rgba = img.to_rgba8();
+                        let (iw, ih) = img.dimensions();
                         let bytes = rgba.as_raw();
-                        let color = egui::ColorImage::from_rgba_unmultiplied([iw as usize, ih as usize], bytes);
-                        let tex = ctx.load_texture("preview_image", color, egui::TextureOptions::LINEAR);
+                        let color = egui::ColorImage::from_rgba_unmultiplied(
+                            [iw as usize, ih as usize],
+                            bytes,
+                        );
+                        let tex =
+                            ctx.load_texture("preview_image", color, egui::TextureOptions::LINEAR);
                         self.preview.texture = Some(tex);
                         self.preview.current_source = Some(src.clone());
                         self.preview.last_size = (w as u32, h as u32);
@@ -173,8 +215,10 @@ impl App {
                 }
             }
             if let Some(tex) = &self.preview.texture {
+                let size = tex.size();
+                let dest = fit_rect_to_content(rect, size[0] as f32, size[1] as f32);
                 let uv = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
-                painter.image(tex.id(), rect, uv, egui::Color32::WHITE);
+                painter.image(tex.id(), dest, uv, egui::Color32::WHITE);
             }
             return;
         }
@@ -195,7 +239,11 @@ impl App {
             .map(|f| f.props.fps as f64)
             .filter(|v| *v > 0.0 && v.is_finite())
             .unwrap_or_else(|| (self.seq.fps.num.max(1) as f64) / (self.seq.fps.den.max(1) as f64));
-        let frame_dur = if clip_fps > 0.0 { 1.0 / clip_fps } else { 1.0 / 30.0 };
+        let frame_dur = if clip_fps > 0.0 {
+            1.0 / clip_fps
+        } else {
+            1.0 / 30.0
+        };
         let epsilon = (0.25 * frame_dur).max(0.010);
 
         // Dispatch commands based on state with epsilon gating.
@@ -206,7 +254,10 @@ impl App {
                 if self.last_sent != Some(k.clone()) {
                     let _ = self.decode_mgr.send_cmd(
                         &active_path,
-                        DecodeCmd::Play { start_pts: media_t, rate: self.engine.rate },
+                        DecodeCmd::Play {
+                            start_pts: media_t,
+                            rate: self.engine.rate,
+                        },
                     );
                     self.last_sent = Some(k);
                     self.last_seek_sent_pts = None;
@@ -228,17 +279,29 @@ impl App {
                                 .take_latest(&active_path)
                                 .map(|f| f.props.fps as f64)
                                 .filter(|v| *v > 0.0 && v.is_finite())
-                                .unwrap_or_else(|| (self.seq.fps.num.max(1) as f64)
-                                    / (self.seq.fps.den.max(1) as f64));
-                            let frame_dur = if fps_clip > 0.0 { 1.0 / fps_clip } else { 1.0 / 30.0 };
+                                .unwrap_or_else(|| {
+                                    (self.seq.fps.num.max(1) as f64)
+                                        / (self.seq.fps.den.max(1) as f64)
+                                });
+                            let frame_dur = if fps_clip > 0.0 {
+                                1.0 / fps_clip
+                            } else {
+                                1.0 / 30.0
+                            };
                             let dt_frames = ((media_t - *last_pts).abs() / frame_dur).abs();
-                            should_clear = dt_frames > (self.settings.clear_threshold_frames as f64);
+                            should_clear =
+                                dt_frames > (self.settings.clear_threshold_frames as f64);
                         }
                     }
-                    if should_clear { self.decode_mgr.clear_latest(&active_path); }
-                    let _ = self
-                        .decode_mgr
-                        .send_cmd(&active_path, DecodeCmd::Seek { target_pts: media_t });
+                    if should_clear {
+                        self.decode_mgr.clear_latest(&active_path);
+                    }
+                    let _ = self.decode_mgr.send_cmd(
+                        &active_path,
+                        DecodeCmd::Seek {
+                            target_pts: media_t,
+                        },
+                    );
                     // Worker will transition to Paused after delivering a frame; keep UI paused/scrubbing
                     self.last_seek_sent_pts = Some(media_t);
                     self.last_seek_request_at = Some(std::time::Instant::now());
@@ -270,7 +333,11 @@ impl App {
                     .last_seek_request_at
                     .map(|t| {
                         let ms = t.elapsed().as_millis();
-                        if waiting_for_accurate { ms > adaptive_ms } else { false }
+                        if waiting_for_accurate {
+                            ms > adaptive_ms
+                        } else {
+                            false
+                        }
                     })
                     .unwrap_or(false);
                 if need || stale_seek {
@@ -283,17 +350,29 @@ impl App {
                                 .take_latest(&active_path)
                                 .map(|f| f.props.fps as f64)
                                 .filter(|v| *v > 0.0 && v.is_finite())
-                                .unwrap_or_else(|| (self.seq.fps.num.max(1) as f64)
-                                    / (self.seq.fps.den.max(1) as f64));
-                            let frame_dur = if fps_clip > 0.0 { 1.0 / fps_clip } else { 1.0 / 30.0 };
+                                .unwrap_or_else(|| {
+                                    (self.seq.fps.num.max(1) as f64)
+                                        / (self.seq.fps.den.max(1) as f64)
+                                });
+                            let frame_dur = if fps_clip > 0.0 {
+                                1.0 / fps_clip
+                            } else {
+                                1.0 / 30.0
+                            };
                             let dt_frames = ((media_t - *last_pts).abs() / frame_dur).abs();
-                            should_clear = dt_frames > (self.settings.clear_threshold_frames as f64);
+                            should_clear =
+                                dt_frames > (self.settings.clear_threshold_frames as f64);
                         }
                     }
-                    if should_clear { self.decode_mgr.clear_latest(&active_path); }
-                    let _ = self
-                        .decode_mgr
-                        .send_cmd(&active_path, DecodeCmd::Seek { target_pts: media_t });
+                    if should_clear {
+                        self.decode_mgr.clear_latest(&active_path);
+                    }
+                    let _ = self.decode_mgr.send_cmd(
+                        &active_path,
+                        DecodeCmd::Seek {
+                            target_pts: media_t,
+                        },
+                    );
                     self.last_seek_sent_pts = Some(media_t);
                     self.last_seek_request_at = Some(std::time::Instant::now());
                     ctx.request_repaint();
@@ -312,8 +391,14 @@ impl App {
                 .take_latest(&active_path)
                 .map(|f| f.props.fps as f64)
                 .filter(|v| *v > 0.0 && v.is_finite())
-                .unwrap_or_else(|| (self.seq.fps.num.max(1) as f64) / (self.seq.fps.den.max(1) as f64));
-            let frame_dur = if fps_clip > 0.0 { 1.0 / fps_clip } else { 1.0 / 30.0 };
+                .unwrap_or_else(|| {
+                    (self.seq.fps.num.max(1) as f64) / (self.seq.fps.den.max(1) as f64)
+                });
+            let frame_dur = if fps_clip > 0.0 {
+                1.0 / fps_clip
+            } else {
+                1.0 / 30.0
+            };
             // Use user-configured hybrid tolerance
             let frames = if self.strict_pause {
                 self.settings.strict_tolerance_frames as f64
@@ -370,7 +455,10 @@ impl App {
                 if dt > (0.5 * frame_dur).max(0.015) && cooldown_ok {
                     let _ = self.decode_mgr.send_cmd(
                         &active_path,
-                        DecodeCmd::Play { start_pts: media_t, rate: self.engine.rate },
+                        DecodeCmd::Play {
+                            start_pts: media_t,
+                            rate: self.engine.rate,
+                        },
                     );
                     self.last_play_reanchor_time = Some(std::time::Instant::now());
                 }
@@ -424,7 +512,12 @@ impl App {
                                     egui::pos2(0.0, 0.0),
                                     egui::pos2(1.0, 1.0),
                                 );
-                                painter.image(id, rect, uv_rect, egui::Color32::WHITE);
+                                let dest = fit_rect_to_content(
+                                    rect,
+                                    frame_out.props.w as f32,
+                                    frame_out.props.h as f32,
+                                );
+                                painter.image(id, dest, uv_rect, egui::Color32::WHITE);
                                 trace!("preview presented frame");
                                 // Update last presented pts for hybrid clearing heuristic
                                 self.last_present_pts = Some((active_path.clone(), frame_out.pts));
@@ -433,21 +526,33 @@ impl App {
                     }
                 }
             }
-        } else {
-            // Center placeholder (include elapsed if available)
-            let seeking_label = if let Some(t0) = self.last_seek_request_at {
-                let ms = t0.elapsed().as_millis();
-                format!("Seeking… ({} ms)", ms)
-            } else {
-                "Seeking…".to_string()
-            };
-            painter.text(
-                rect.center(),
-                egui::Align2::CENTER_CENTER,
-                seeking_label,
-                egui::FontId::proportional(16.0),
-                egui::Color32::GRAY,
-            );
+        } else if !matches!(self.engine.state, PlayState::Playing) {
+            let mut drew_previous = false;
+            if let Some(slot) = self.preview.stream.as_ref() {
+                if let (Some(id), w, h) = (slot.egui_tex_id, slot.width, slot.height) {
+                    let dest = fit_rect_to_content(rect, w as f32, h as f32);
+                    let uv_rect =
+                        egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
+                    painter.image(id, dest, uv_rect, egui::Color32::WHITE);
+                    drew_previous = true;
+                }
+            }
+
+            if !drew_previous {
+                let seeking_label = if let Some(t0) = self.last_seek_request_at {
+                    let ms = t0.elapsed().as_millis();
+                    format!("Seeking… ({} ms)", ms)
+                } else {
+                    "Seeking…".to_string()
+                };
+                painter.text(
+                    rect.center(),
+                    egui::Align2::CENTER_CENTER,
+                    seeking_label,
+                    egui::FontId::proportional(16.0),
+                    egui::Color32::GRAY,
+                );
+            }
         }
 
         // Lightweight debug overlay: resolved source path and media time, plus lock indicator
@@ -456,7 +561,9 @@ impl App {
         let displayed_pts = latest.as_ref().map(|f| f.pts);
         let displayed_approx = latest.as_ref().map(|f| !f.accurate).unwrap_or(false);
         let diff = displayed_pts.map(|p| (p - media_t).abs());
-        let locked = diff.map(|d| d <= (0.5 * frame_dur).max(0.015)).unwrap_or(false);
+        let locked = diff
+            .map(|d| d <= (0.5 * frame_dur).max(0.015))
+            .unwrap_or(false);
         let overlay = format!(
             "src: {}\nmedia_t: {:.3}s  state: {:?}  {}\nlock: {}{}",
             std::path::Path::new(&active_path)

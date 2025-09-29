@@ -109,14 +109,49 @@ pub(crate) fn spawn_worker(path: &str, ui_ctx: EguiContext) -> DecodeWorkerRunti
             while let Ok(cmd) = cmd_rx.try_recv() {
                 match cmd {
                     DecodeCmd::Play { start_pts, rate: r } => {
-                        // Only (re)anchor when transitioning into Playing; otherwise keep smooth progression
-                        if mode != PlayState::Playing {
-                            mode = PlayState::Playing;
-                            anchor_pts = start_pts;
-                            anchor_t = Instant::now();
-                            // Resume streaming mode in decoder
-                            cpu_dec.set_strict_paused(false);
+                        let reposition = (anchor_pts - start_pts).abs() > 0.000_001;
+                        if reposition {
+                            let _ = cpu_dec.seek_to(start_pts);
+                            approx_shown = false;
+                            pending.clear();
+
+                            let mut warm = cpu_dec.decode_frame(start_pts).ok().flatten();
+                            let mut tries = 0;
+                            while warm.is_none() && tries < PREFETCH_BUDGET_PER_TICK {
+                                let _ = cpu_dec.decode_frame(start_pts);
+                                tries += 1;
+                                warm = cpu_dec.decode_frame(start_pts).ok().flatten();
+                            }
+                            if let Some(vf) = warm {
+                                let fmt = match vf.format {
+                                    NativeYuvPixFmt::Nv12 => YuvPixFmt::Nv12,
+                                    NativeYuvPixFmt::P010 => YuvPixFmt::P010,
+                                };
+                                let y: Arc<[u8]> = Arc::from(vf.y_plane.into_boxed_slice());
+                                let uv: Arc<[u8]> = Arc::from(vf.uv_plane.into_boxed_slice());
+                                let out = VideoFrameOut {
+                                    pts: vf.timestamp,
+                                    props: VideoProps {
+                                        w: vf.width,
+                                        h: vf.height,
+                                        fps,
+                                        fmt,
+                                    },
+                                    payload: FramePayload::Cpu { y, uv },
+                                    accurate: true,
+                                };
+                                if let Ok(mut slot) = slot_for_worker.0.lock() {
+                                    *slot = Some(out);
+                                }
+                                ui_ctx.request_repaint();
+                            } else if let Ok(mut slot) = slot_for_worker.0.lock() {
+                                *slot = None;
+                            }
                         }
+                        mode = PlayState::Playing;
+                        anchor_pts = start_pts;
+                        anchor_t = Instant::now();
+                        cpu_dec.set_strict_paused(false);
                         rate = r;
                         need_seek_decode = false; // cancel any pending single-shot seek
                         last_seek_target = None;
@@ -164,12 +199,19 @@ pub(crate) fn spawn_worker(path: &str, ui_ctx: EguiContext) -> DecodeWorkerRunti
                         let uv: Arc<[u8]> = Arc::from(vf.uv_plane.into_boxed_slice());
                         let out = VideoFrameOut {
                             pts: vf.timestamp,
-                            props: VideoProps { w: vf.width, h: vf.height, fps, fmt },
+                            props: VideoProps {
+                                w: vf.width,
+                                h: vf.height,
+                                fps,
+                                fmt,
+                            },
                             payload: FramePayload::Cpu { y, uv },
                             accurate: true,
                         };
                         eprintln!("[WORKER] out pts={:.3}", out.pts);
-                        if let Ok(mut g) = slot_for_worker.0.lock() { *g = Some(out); }
+                        if let Ok(mut g) = slot_for_worker.0.lock() {
+                            *g = Some(out);
+                        }
                         // Push-driven repaint: coalesce to ~vsync (<= 60Hz)
                         if last_repaint.elapsed().as_millis() >= 8 {
                             ui_ctx.request_repaint();
@@ -182,7 +224,10 @@ pub(crate) fn spawn_worker(path: &str, ui_ctx: EguiContext) -> DecodeWorkerRunti
                     if need_seek_decode {
                         let target = anchor_pts;
                         // Coalesce seeks: only re-issue if target changed
-                        if last_seek_target.map(|t| (t - target).abs() > f64::EPSILON).unwrap_or(true) {
+                        if last_seek_target
+                            .map(|t| (t - target).abs() > f64::EPSILON)
+                            .unwrap_or(true)
+                        {
                             // Two-stage: first fast key-unit seek (approximate), then accurate
                             if !approx_shown {
                                 let _ = cpu_dec.seek_to_keyframe(target);
@@ -209,12 +254,19 @@ pub(crate) fn spawn_worker(path: &str, ui_ctx: EguiContext) -> DecodeWorkerRunti
                             let uv: Arc<[u8]> = Arc::from(vf.uv_plane.into_boxed_slice());
                             let out = VideoFrameOut {
                                 pts: vf.timestamp,
-                                props: VideoProps { w: vf.width, h: vf.height, fps, fmt },
+                                props: VideoProps {
+                                    w: vf.width,
+                                    h: vf.height,
+                                    fps,
+                                    fmt,
+                                },
                                 payload: FramePayload::Cpu { y, uv },
                                 accurate: approx_shown, // first stage false, refine (second) true
                             };
                             eprintln!("[WORKER] out pts={:.3}", out.pts);
-                            if let Ok(mut g) = slot_for_worker.0.lock() { *g = Some(out); }
+                            if let Ok(mut g) = slot_for_worker.0.lock() {
+                                *g = Some(out);
+                            }
                             ui_ctx.request_repaint();
                             if !approx_shown {
                                 // Show approximate (key-unit) first; now refine accurately

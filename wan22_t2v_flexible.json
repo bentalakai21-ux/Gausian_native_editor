@@ -61,7 +61,7 @@
     },
     "227": {
       "inputs": {
-        "text": "A dramatic slow-motion cinematic sequence of a car mid-air, actively transforming into a robot after being launched by a fiery explosion, the camera capturing every step of the change: wheels twisting and folding into legs, doors splitting apart and unfolding into arms, hood panels shifting upward to form the chest, headlights sliding into position as glowing robotic eyes, internal gears and pistons moving in sync, sparks and smoke trailing from shifting parts, debris and fire lighting the scene, ultra-detailed metal textures, fluid step-by-step transformation fully visible, high-definition cinematic realism",
+        "text": "A cinematic close-up of ski gear in a high-speed urban chase, sharp focus on polished ski edges carving sparks across asphalt as the skier weaves through traffic. The camera tracks tightly on boots locked into bindings, snow and debris scattering from each turn, neon reflections gliding across the glossy surface of the skis. Motion blur emphasizes speed without losing detail, capturing the dynamic flex of the equipment under pressure. High-definition clarity, ultra-realistic textures of metal, snow, and rubber, cinematic lighting, visceral sense of adrenaline and movement.",
         "clip": ["224", 0]
       },
       "class_type": "CLIPTextEncode",
@@ -71,7 +71,7 @@
     },
     "228": {
       "inputs": {
-        "text": "car only, robot only, no transformation sequence, sudden jump cuts, already-formed robot, blurry, low detail, distorted geometry, missing parts, extra limbs, floating or disconnected panels, stiff or unnatural motion, cartoonish morphing, warped shapes, pixelated, oversaturated, washed out, grainy, text, watermark, logo",
+        "text": "blurry, low quality, pixelated, distorted gear, warped bindings, missing parts, floating skis, poorly drawn details, cartoonish style, stiff or static motion, warped proportions, washed out, oversaturated, overexposed, grainy, text, watermark, logo, static lifeless shot",
         "clip": ["224", 0]
       },
       "class_type": "CLIPTextEncode",
@@ -83,7 +83,7 @@
       "inputs": {
         "width": 480,
         "height": 280,
-        "length": 41,
+        "length": 121,
         "batch_size": 1
       },
       "class_type": "EmptyHunyuanLatentVideo",

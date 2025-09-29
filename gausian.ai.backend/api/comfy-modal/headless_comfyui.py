@@ -1,17 +1,6 @@
-"""
-Headless ComfyUI on Modal — ASGI proxy version (fixed)
+"""Headless ComfyUI on Modal — FastAPI proxy."""
 
-Endpoints at your Modal URL:
-  GET  /health            -> proxies to /system_stats
-  GET  /system_stats      -> ComfyUI system stats
-  GET  /object_info       -> ComfyUI object info (node inputs/loaders)
-  POST /prompt            -> submit a workflow JSON
-  GET  /queue             -> queue status
-  GET  /history/{prompt_id}
-  GET  /debug/models      -> quick check of model symlinks
-  GET  /debug/extra_paths -> dumps the YAML Comfy will load
-"""
-
+import contextlib
 import os
 import pathlib
 import socket
@@ -19,8 +8,10 @@ import subprocess
 import threading
 import time
 import urllib.request
+from urllib.parse import quote
 import modal
 import random
+import requests
 try:
     from botocore.exceptions import ClientError, NoCredentialsError, EndpointConnectionError
 except Exception:  # botocore may not be present until runtime
@@ -40,11 +31,215 @@ job_prefixes: Dict[str, str] = {}
 # Remote/public URLs by job id and filename (to avoid /view cold-starts)
 # S3 object keys by job id and filename (to generate presigned URLs on demand)
 job_object_keys: Dict[str, Dict[str, str]] = {}
+job_aliases: Dict[str, Set[str]] = {}
 downloads_seen: Set[str] = set()
 # Clients may post an explicit ACK when they finish importing artifacts for a job.
 # This prevents premature shutdown when downloads are proxied externally.
 jobs_imported_ack: Set[str] = set()
 job_completed_at: Dict[str, float] = {}
+jobs_ready_for_close: Set[str] = set()
+
+# Optional pull-trigger to a local app. If APP_PULL_URL_TEMPLATE is set, we will
+# call it for each completed artifact with the artifact's absolute /view URL.
+# The template may contain {url} and {filename} placeholders and will be expanded.
+def _trigger_app_pull(url: str, filename: str) -> None:
+    try:
+        tpl = (os.environ.get("APP_PULL_URL_TEMPLATE") or os.environ.get("DOWNLOAD_CALLBACK_URL") or "").strip()
+        if not tpl:
+            return
+        # Basic templating; fall back to ?url= when placeholder missing
+        from urllib.parse import quote as _q
+        filled = None
+        try:
+            if "{url}" in tpl or "{filename}" in tpl:
+                filled = tpl.replace("{url}", _q(url, safe="")).replace("{filename}", _q(filename, safe=""))
+            else:
+                sep = '&' if ('?' in tpl) else '?'
+                filled = f"{tpl}{sep}url={_q(url, safe='')}"
+        except Exception:
+            filled = None
+        if not filled:
+            return
+        # Fire-and-forget GET
+        try:
+            with requests.get(filled, timeout=15) as resp:
+                print(f"[CALLBACK] GET {filled} -> {resp.status_code}", flush=True)
+        except Exception as exc:
+            print(f"[CALLBACK] Failed GET {filled}: {exc}", flush=True)
+    except Exception:
+        pass
+
+
+def _publish_ws_event(event: dict) -> None:
+    """Safely dispatch an event to any connected websocket clients."""
+    global event_publisher
+    if event_publisher is None:
+        return
+    try:
+        event_publisher(event)
+    except Exception as exc:  # pragma: no cover - defensive log only
+        print(f"[WS] publish failed for {event.get('type')}: {exc}", flush=True)
+
+
+def _prefetch_view_url(url: str) -> None:
+    """Trigger a lightweight GET /view request so the artifact is ready to stream."""
+    try:
+        with requests.get(url, stream=True, timeout=20) as resp:
+            if resp.status_code // 100 != 2:
+                print(f"[VIEW] Prefetch failed {resp.status_code} for {url}", flush=True)
+                return
+            # Consume a small chunk to ensure the file handle is actually opened, then close.
+            with contextlib.suppress(StopIteration):
+                next(resp.iter_content(chunk_size=1024))
+        _publish_ws_event({"type": "log", "message": f"prefetched {url}"})
+    except Exception as exc:
+        print(f"[VIEW] Prefetch error for {url}: {exc}", flush=True)
+
+def _stream_view_url(url: str) -> None:
+    """Request the /view URL and stream it fully to completion.
+    This marks downloads_seen server-side and keeps the container active while reading.
+    """
+    try:
+        with requests.get(url, stream=True, timeout=60) as resp:
+            if resp.status_code // 100 != 2:
+                print(f"[VIEW] Stream failed {resp.status_code} for {url}", flush=True)
+                return
+            total = 0
+            for chunk in resp.iter_content(chunk_size=1024 * 1024):
+                if not chunk:
+                    continue
+                total += len(chunk)
+                # Touch last_activity to avoid idle shutdown while streaming
+                try:
+                    global job_manager
+                    job_manager.last_activity = time.time()
+                except Exception:
+                    pass
+        print(f"[VIEW] Stream complete ({total/1_048_576:.1f} MB): {url}", flush=True)
+    except Exception as exc:
+        print(f"[VIEW] Stream error for {url}: {exc}", flush=True)
+
+# --------- Backend URL resolution (for notifying /api/media/modal-upload) ---------
+def _resolve_backend_base() -> Optional[str]:
+    """Return a usable backend base URL, preferring env vars and avoiding localhost.
+
+    We try several common variable names so deployments can wire any of them
+    via Modal secrets without modifying this file. We intentionally ignore
+    localhost/127.* defaults inside Modal because they won't reach your API.
+    """
+    import re
+    import os as _os
+    candidates: list[str] = []
+    for name in [
+        "BACKEND_URL",
+        "PUBLIC_BACKEND_URL",
+        "GAUSIAN_BACKEND_URL",
+        "API_BASE_URL",
+        "VITE_API_BASE_URL",
+        "VITE_CLOUDFLARE_TUNNEL_URL",
+        "CLOUDFLARE_TUNNEL_URL",
+        "WS_BASE_URL",
+        "VITE_WS_BASE_URL",
+    ]:
+        v = (_os.environ.get(name) or "").strip()
+        if v:
+            candidates.append(v)
+    # Drop obviously local bases
+    def _bad(u: str) -> bool:
+        s = u.lower()
+        return ("localhost" in s) or ("127.0.0.1" in s) or s.startswith("http://0.0.0.0")
+    candidates = [c for c in candidates if not _bad(c)]
+    if not candidates:
+        return None
+    # Normalize: ensure scheme
+    def _norm(u: str) -> str:
+        u = u.strip()
+        if not re.match(r"^https?://", u):
+            return f"https://{u}"
+        return u
+    for raw in candidates:
+        base = _norm(raw).rstrip("/")
+        # Quick health probe (best-effort, ignore failures to avoid stalling uploads)
+        try:
+            import urllib.request as _rq
+            with _rq.urlopen(base + "/api/health", timeout=3) as r:  # server exposes /api/health
+                if int(getattr(r, 'status', 200)) // 100 == 2:
+                    return base
+        except Exception:
+            # Accept without health if it's a plausible URL (e.g., private API)
+            try:
+                from urllib.parse import urlparse as _up
+                if _up(base).netloc:
+                    return base
+            except Exception:
+                pass
+    return None
+
+# --------- S3 manifest helpers ---------
+def _s3_client_for_env():
+    try:
+        import boto3
+        from botocore.config import Config
+    except Exception:
+        return None
+    endpoint = os.environ.get("S3_ENDPOINT")
+    region = os.environ.get("S3_REGION") or os.environ.get("AWS_REGION") or "us-east-1"
+    timeout = int(os.environ.get("S3_TIMEOUT", "30"))
+    cfg = Config(connect_timeout=timeout, read_timeout=timeout, retries={"max_attempts": 3, "mode": "standard"})
+    try:
+        if endpoint:
+            return boto3.client("s3", region_name=region, endpoint_url=endpoint, config=cfg)
+        else:
+            return boto3.client("s3", region_name=region, config=cfg)
+    except Exception:
+        return None
+
+def _s3_write_manifest(job_id: str, obj_map: Dict[str, str]) -> None:
+    bucket = os.environ.get("S3_BUCKET")
+    if not bucket:
+        return
+    s3 = _s3_client_for_env()
+    if not s3:
+        return
+    try:
+        import json as _j
+        key = f"jobs/{job_id}/manifest.json"
+        # Merge with existing manifest if present
+        try:
+            cur = _s3_read_manifest(job_id) or {}
+        except Exception:
+            cur = {}
+        merged = dict(cur)
+        merged.update(obj_map or {})
+        body = _j.dumps({
+            "id": job_id,
+            "artifacts": [{"filename": k, "s3_key": v} for k, v in merged.items()],
+        }).encode("utf-8")
+        s3.put_object(Bucket=bucket, Key=key, Body=body, ContentType="application/json")
+    except Exception:
+        pass
+
+def _s3_read_manifest(job_id: str) -> Optional[Dict[str, str]]:
+    bucket = os.environ.get("S3_BUCKET")
+    if not bucket:
+        return None
+    s3 = _s3_client_for_env()
+    if not s3:
+        return None
+    try:
+        import json as _j
+        key = f"jobs/{job_id}/manifest.json"
+        obj = s3.get_object(Bucket=bucket, Key=key)
+        data = _j.loads(obj["Body"].read())
+        items = data.get("artifacts") or []
+        mp = {}
+        for it in items:
+            fn = (it or {}).get("filename"); sk = (it or {}).get("s3_key")
+            if isinstance(fn, str) and fn and isinstance(sk, str) and sk:
+                mp[fn] = sk
+        return mp or None
+    except Exception:
+        return None
 
 # Persistent job state helpers (cross-replica)
 def _jobs_dir() -> pathlib.Path:
@@ -93,6 +288,16 @@ def _persist_job_state(job_key: str, patch: dict) -> None:
                     patch["progress_percent"] = prev
             except Exception:
                 pass
+        # Merge object_keys mapping if provided (persist S3 keys per artifact)
+        try:
+            if isinstance(patch.get('object_keys'), dict):
+                prev_map = cur.get('object_keys') if isinstance(cur.get('object_keys'), dict) else {}
+                merged = dict(prev_map)
+                merged.update(patch.get('object_keys'))
+                patch = dict(patch)
+                patch['object_keys'] = merged
+        except Exception:
+            pass
         cur.update(patch)
         # Always include the id and a timestamp
         cur.setdefault("id", job_key)
@@ -391,14 +596,22 @@ def _monitor_job_completion(job_id, prompt_id, job_manager_instance, plan_or_tot
                         except Exception:
                             pass
                         # Aggregate: sum(weight * progress) + encode_done
-                        agg = sum(per_node_weights.get(nid, 0) * per_node_progress.get(nid, 0.0) for nid in per_node_weights.keys()) + sum(encode_weights.get(nid, 0) for nid in encode_done)
+                        agg_sampling = sum(
+                            per_node_weights.get(nid, 0) * per_node_progress.get(nid, 0.0)
+                            for nid in per_node_weights.keys()
+                        )
+                        enc_done_weight = sum(encode_weights.get(nid, 0) for nid in encode_done)
+                        agg = agg_sampling + enc_done_weight
                         # Normalize aggregate to frames so progress reaches 100% by the time frames complete
                         frames = 0
                         try:
                             frames = int((plan_or_total or {}).get('frames') or 0) if isinstance(plan_or_total, dict) else 0
                         except Exception:
                             frames = 0
-                        total_full = max(1, (sum(per_node_weights.values()) + sum(encode_weights.values())) or total_steps_plan or 1)
+                        # Denominator adapts: do not include full encode weight until it's actually done,
+                        # otherwise progress plateaus early (e.g., at ~33%).
+                        base_sampling = sum(per_node_weights.values())
+                        total_full = max(1, (base_sampling + enc_done_weight) or total_steps_plan or 1)
                         total_norm = frames if frames > 0 else total_full
                         cur_norm = int(round((agg / float(total_full)) * total_norm))
                         cur_norm = max(0, min(total_norm, cur_norm))
@@ -470,14 +683,20 @@ def _monitor_job_completion(job_id, prompt_id, job_manager_instance, plan_or_tot
                             per_node_progress[node_id] = 1.0
                         if node_id in encode_weights:
                             encode_done.add(node_id)
-                        agg = sum(per_node_weights.get(nid, 0) * per_node_progress.get(nid, 0.0) for nid in per_node_weights.keys()) + sum(encode_weights.get(nid, 0) for nid in encode_done)
+                        agg_sampling = sum(
+                            per_node_weights.get(nid, 0) * per_node_progress.get(nid, 0.0)
+                            for nid in per_node_weights.keys()
+                        )
+                        enc_done_weight = sum(encode_weights.get(nid, 0) for nid in encode_done)
+                        agg = agg_sampling + enc_done_weight
                         # Normalize aggregate to frames
                         frames = 0
                         try:
                             frames = int((plan_or_total or {}).get('frames') or 0) if isinstance(plan_or_total, dict) else 0
                         except Exception:
                             frames = 0
-                        total_full = max(1, (sum(per_node_weights.values()) + sum(encode_weights.values())) or total_steps_plan or 1)
+                        base_sampling = sum(per_node_weights.values())
+                        total_full = max(1, (base_sampling + enc_done_weight) or total_steps_plan or 1)
                         total_norm = frames if frames > 0 else total_full
                         cur_norm = int(round((agg / float(total_full)) * total_norm))
                         cur_norm = max(0, min(total_norm, cur_norm))
@@ -523,7 +742,17 @@ def _monitor_job_completion(job_id, prompt_id, job_manager_instance, plan_or_tot
         except Exception:
             def _q(s):
                 return s
-        ws_url = f"ws://127.0.0.1:8188/ws?clientId={_q(str(job_id))}"
+        # Bind to the same client_id used in the POST body
+        # ComfyUI routes progress/events by client_id, not prompt_id.
+        cid = str(job_id) if job_id is not None else ""
+        if not cid and prompt_id is not None:
+            # Fallback only if job_id is missing
+            cid = str(prompt_id)
+        ws_url = f"ws://127.0.0.1:8188/ws?clientId={_q(cid)}"
+        try:
+            print(f"[WEBSOCKET] Dialing ComfyUI with clientId={cid} (job_id={job_id}, prompt_id={prompt_id})", flush=True)
+        except Exception:
+            pass
         ws = websocket.WebSocketApp(ws_url,
                                   on_open=on_websocket_open,
                                   on_message=on_websocket_message,
@@ -536,6 +765,7 @@ def _monitor_job_completion(job_id, prompt_id, job_manager_instance, plan_or_tot
         
         # Monitor for actual completion
         monitor_count = 0
+        failure_streak = 0
         last_progress_time = time.time()
         
         while monitor_count < 120:  # Max 10 minutes of monitoring
@@ -589,6 +819,34 @@ def _monitor_job_completion(job_id, prompt_id, job_manager_instance, plan_or_tot
                                         job_object_keys.setdefault(key_id, {})[video_rel] = key
                                     except Exception:
                                         pass
+                                    # Persist mapping so /jobs can presign across cold starts
+                                    try:
+                                        _persist_job_state(key_id, {'object_keys': {video_rel: key}})
+                                    except Exception:
+                                        pass
+                                    # Also write/update an S3 manifest for this job for cross-replica availability
+                                    try:
+                                        _s3_write_manifest(key_id, {video_rel: key})
+                                    except Exception:
+                                        pass
+                                    # Mirror object key + manifest under prompt_id alias so /artifacts and /jobs work with either id
+                                    try:
+                                        if prompt_id is not None:
+                                            alias = str(prompt_id)
+                                            try:
+                                                job_object_keys.setdefault(alias, {})[video_rel] = key
+                                            except Exception:
+                                                pass
+                                            try:
+                                                _persist_job_state(alias, {'object_keys': {video_rel: key}})
+                                            except Exception:
+                                                pass
+                                            try:
+                                                _s3_write_manifest(alias, {video_rel: key})
+                                            except Exception:
+                                                pass
+                                    except Exception:
+                                        pass
                                 if not ok:
                                     job_manager_instance.uploaded_videos.discard(video_rel)
                             finally:
@@ -602,27 +860,36 @@ def _monitor_job_completion(job_id, prompt_id, job_manager_instance, plan_or_tot
                             expect_prefix = job_prefixes.get(key_id) or job_prefixes.get(str(job_id))
                         except Exception:
                             expect_prefix = None
-                        rels = []
-                        for _p in current_videos:
-                            try:
-                                rel = _p.relative_to(output_dir).as_posix()
-                            except Exception:
-                                rel = _p.name
+                        rels: list[str] = []
+                        for rel in current_videos:
+                            # current_videos is a set[str] of paths relative to /outputs
                             if expect_prefix:
-                                # Compare against basename to avoid subfolder mismatch
-                                base = (_p.name)
+                                base = rel.split('/')[-1]
                                 if not base.startswith(expect_prefix):
                                     continue
                             rels.append(rel)
                         artifacts_list = sorted(rels)
                         _persist_job_state(key_id, {'artifacts': artifacts_list})
+                        try:
+                            if prompt_id is not None:
+                                _persist_job_state(str(prompt_id), {'artifacts': artifacts_list})
+                        except Exception:
+                            pass
                     except Exception:
                         pass
                 
                 # Complete job when Comfy queue is empty (all nodes executed)
+                # and no uploads are in progress (avoid racing /jobs calls before URLs are ready)
                 if no_queue_activity:
+                    try:
+                        if getattr(job_manager_instance, 'uploads_in_progress', 0) > 0:
+                            print(f"[MONITOR] Job {job_id} waiting for uploads ({job_manager_instance.uploads_in_progress}) before marking complete", flush=True)
+                            time.sleep(2)
+                            continue
+                    except Exception:
+                        pass
                     print(f"[MONITOR] Job {job_id} TRULY complete - Queue empty, videos generated, progress stalled", flush=True)
-                    # Record artifacts for /jobs API
+                    # Record artifacts for /jobs API (mirror under both client_id and prompt_id)
                     try:
                         global job_artifacts, job_completed_at
                         arts: list[str] = []
@@ -661,54 +928,136 @@ def _monitor_job_completion(job_id, prompt_id, job_manager_instance, plan_or_tot
                                         continue
                                 rels.append(rel)
                             arts = sorted(rels)
-                        job_artifacts[key_id] = sorted(list(set(arts)))
+                        finalized = sorted(list(set(arts)))
+                        job_artifacts[key_id] = finalized
                         job_completed_at[key_id] = time.time()
+                        # Mirror under prompt_id as well for callers using that id
+                        try:
+                            if prompt_id is not None:
+                                alias = str(prompt_id)
+                                job_artifacts[alias] = list(finalized)
+                                job_completed_at[alias] = time.time()
+                        except Exception:
+                            pass
                     except Exception:
                         pass
                     # Persist completed state for cross-replica clients
                     try:
-                        _persist_job_state(key_id, {
+                        payload_state = {
                             'status': 'completed',
                             'progress_percent': 100.0,
                             'artifacts': job_artifacts.get(key_id, []),
                             'completed_at': time.time(),
-                        })
+                        }
+                        _persist_job_state(key_id, payload_state)
+                        try:
+                            if prompt_id is not None:
+                                # Ensure artifacts also visible under prompt_id
+                                alt = dict(payload_state)
+                                alt['artifacts'] = job_artifacts.get(str(prompt_id), []) or job_artifacts.get(key_id, [])
+                                _persist_job_state(str(prompt_id), alt)
+                        except Exception:
+                            pass
                     except Exception:
                         pass
                     job_manager_instance.job_completed(job_id)
-                    # Publish WS event to connected clients (if publisher available)
+                    # Publish WS event to connected clients (if available)
                     try:
-                        global event_publisher
-                        if event_publisher is not None:
-                            event_publisher({"type": "job_completed", "job_id": key_id})
-                            # If no other jobs are running and the Comfy queue is empty, close WS immediately.
-                            try:
-                                import urllib.request, json as _j
-                                empty_queue = False
+                        _publish_ws_event({
+                            "type": "log",
+                            "message": f"job_completed:{str(prompt_id) if prompt_id is not None else key_id}",
+                        })
+                        arts_payload: list[dict[str, str]] = []
+                        try:
+                            names = job_artifacts.get(key_id, [])
+                            for name in names:
+                                url = None
                                 try:
-                                    r = urllib.request.urlopen("http://127.0.0.1:8188/queue", timeout=3)
-                                    d = _j.loads(r.read().decode())
-                                    empty_queue = len(d.get("queue_pending", [])) == 0 and len(d.get("queue_running", [])) == 0
+                                    key = (job_object_keys.get(key_id) or {}).get(name)
                                 except Exception:
-                                    # If queue probe fails, assume empty to prefer closing
-                                    empty_queue = True
-                                if empty_queue and len(job_manager_instance.active_jobs) == 0:
-                                    event_publisher({"type": "server_idle_close"})
-                                    # Also close sockets directly for immediate shutdown
+                                    key = None
+                                if key:
                                     try:
-                                        close_all_ws()
+                                        import boto3
+                                        expire = int(os.environ.get("ARTIFACT_URL_EXPIRE", "86400"))
+                                        region = os.environ.get("S3_REGION") or os.environ.get("AWS_REGION")
+                                        endpoint = os.environ.get("S3_ENDPOINT")
+                                        bucket = os.environ.get("S3_BUCKET")
+                                        s3 = boto3.client("s3", region_name=region, endpoint_url=endpoint) if endpoint else boto3.client("s3", region_name=region)
+                                        url = s3.generate_presigned_url("get_object", Params={"Bucket": bucket, "Key": key}, ExpiresIn=expire)
+                                    except Exception:
+                                        url = None
+                                if not url:
+                                    try:
+                                        url = f"/view?filename={quote(name)}"
+                                    except Exception:
+                                        url = f"/view?filename={name}"
+                                if url:
+                                    full_url = url if url.startswith("http") else url
+                                    arts_payload.append({"filename": name, "url": full_url})
+                                    # Optional: trigger a client pull (app should resolve the right base).
+                                    try:
+                                        _trigger_app_pull(full_url, name)
                                     except Exception:
                                         pass
-                            except Exception:
-                                pass
+                        except Exception:
+                            arts_payload = []
+
+                        # Also include a canonical view-by-id path for clients
+                        try:
+                            view_by_id = f"/view/{str(prompt_id) if prompt_id is not None else key_id}"
+                            arts_payload.append({"filename": f"{str(prompt_id) if prompt_id is not None else key_id}.mp4", "url": view_by_id})
+                        except Exception:
+                            pass
+
+                        ev = {
+                            "type": "job_completed",
+                            "job_id": str(prompt_id) if prompt_id is not None else key_id,
+                            "client_id": key_id,
+                        }
+                        if arts_payload:
+                            ev["artifacts"] = arts_payload
+                        _publish_ws_event(ev)
+                        try:
+                            jobs_ready_for_close.add(key_id)
+                            jobs_aliases_for_key = job_aliases.setdefault(key_id, set())
+                            jobs_aliases_for_key.add(key_id)
+                            if prompt_id is not None:
+                                alias = str(prompt_id)
+                                jobs_ready_for_close.add(alias)
+                                job_aliases.setdefault(key_id, set()).add(alias)
+                                job_aliases.setdefault(alias, set()).update({key_id, alias})
+                        except Exception:
+                            pass
                     except Exception:
                         pass
                     ws.close()
                     break
                 
+                failure_streak = 0
             except Exception as e:
+                failure_streak += 1
                 print(f"[MONITOR] Monitoring iteration {monitor_count}: {e}", flush=True)
-            
+                if failure_streak >= 6:
+                    print(f"[MONITOR] Excessive errors for job {job_id}; aborting", flush=True)
+                    try:
+                        _publish_ws_event({"type": "log", "message": f"job_abort:{job_id}"})
+                    except Exception:
+                        pass
+                    try:
+                        job_manager_instance.job_completed(job_id)
+                    except Exception:
+                        pass
+                    try:
+                        _persist_job_state(key_id, {'status': 'error', 'error': 'monitor_timeout'})
+                    except Exception:
+                        pass
+                    try:
+                        ws.close()
+                    except Exception:
+                        pass
+                    return
+
             monitor_count += 1
             time.sleep(5)  # Check every 5 seconds
             
@@ -751,7 +1100,17 @@ def _upload_to_backblaze_enhanced(video_path, meta: Optional[dict] = None):
     if not video_file.exists():
         print(f"[UPLOAD] Video file not found: {video_path}", flush=True)
         return False, None
-    
+
+    # Direct import mode: keep artifacts on the Modal volume for the desktop client to fetch.
+    try:
+        print(
+            f"[UPLOAD] Remote upload disabled — retaining {video_file.name} for direct download",
+            flush=True,
+        )
+    except Exception:
+        pass
+    return True, None
+
     # Get configuration
     bucket = os.environ.get("S3_BUCKET")
     region = os.environ.get("S3_REGION", "us-east-1")
@@ -1145,7 +1504,10 @@ def _notify_backend_pending_upload(persistent_path, filename):
         import requests
         import os
         
-        backend_url = os.environ.get("BACKEND_URL", "http://localhost:3001")
+        backend_base = _resolve_backend_base()
+        if not backend_base:
+            print("[FALLBACK] No BACKEND_URL configured; skipping pending-upload notify", flush=True)
+            return
         
         payload = {
             "type": "pending_upload",
@@ -1155,7 +1517,7 @@ def _notify_backend_pending_upload(persistent_path, filename):
         }
         
         response = requests.post(
-            f"{backend_url}/api/media/pending-upload",
+            f"{backend_base}/api/media/pending-upload",
             json=payload,
             timeout=10
         )
@@ -1245,8 +1607,11 @@ def _notify_backend_upload(key, public_url, filename, project_id=None, user_id=N
                 project_id = project_id or match.group(2)
                 print(f"[UPLOAD] Extracted from filename - User: {user_id}, Project: {project_id}", flush=True)
         
-        # Get backend URL from environment or use default
-        backend_url = os.environ.get("BACKEND_URL", "http://localhost:3001")
+        # Resolve backend base URL (avoids localhost inside Modal)
+        backend_base = _resolve_backend_base()
+        if not backend_base:
+            print("[UPLOAD] No BACKEND_URL configured; skipping backend notification", flush=True)
+            return
         
         # Notify backend via API call with project association
         payload = {
@@ -1260,7 +1625,7 @@ def _notify_backend_upload(key, public_url, filename, project_id=None, user_id=N
         }
         
         response = requests.post(
-            f"{backend_url}/api/media/modal-upload",
+            f"{backend_base}/api/media/modal-upload",
             json=payload,
             timeout=10
         )
@@ -1270,8 +1635,11 @@ def _notify_backend_upload(key, public_url, filename, project_id=None, user_id=N
             print(f"[UPLOAD] Project: {project_id} | User: {user_id}", flush=True)
         else:
             print(f"[UPLOAD] Backend notification failed: {response.status_code}", flush=True)
-            print(f"[UPLOAD] Response: {response.text if hasattr(response, 'text') else 'No response text'}", flush=True)
-            
+            try:
+                print(f"[UPLOAD] Response: {response.text}", flush=True)
+            except Exception:
+                pass
+        
     except Exception as e:
         print(f"[UPLOAD] Error notifying backend: {e}", flush=True)
 
@@ -1471,6 +1839,7 @@ def comfyui():
             self.last_activity = time.time()
             self.ws_clients = 0  # Number of connected WS clients
             self.server_ready = False  # Gate shutdown until Comfy is ready
+            self.last_completed_at = 0.0  # Enforce a minimum wait window after completion
             self._start_shutdown_monitor()
         
         def _start_shutdown_monitor(self):
@@ -1484,10 +1853,69 @@ def comfyui():
                         if not self.server_ready:
                             continue
 
-                        # Tight shutdown: as soon as no active jobs AND no WS clients, exit
-                        if len(self.active_jobs) == 0 and self.ws_clients == 0 and self.uploads_in_progress == 0:
-                            print("[SHUTDOWN] No active jobs, no WS clients, no uploads — shutting down now", flush=True)
-                            os._exit(0)
+                        # Safe shutdown: require imports ACK (or grace) once jobs complete, even if no WS clients
+                        if len(self.active_jobs) == 0 and self.uploads_in_progress == 0:
+                            # If there are no WS clients, still wait for client imports or grace before exit
+                            if self.ws_clients == 0:
+                                try:
+                                    GRACE = float(os.environ.get("SHUTDOWN_GRACE_SECONDS", "60"))
+                                except Exception:
+                                    GRACE = 60.0
+                                # Enforce a minimum wait window after completion to allow the desktop to issue /view
+                                try:
+                                    MIN_WAIT = float(os.environ.get("IMPORT_WAIT_SECONDS", "20"))
+                                except Exception:
+                                    MIN_WAIT = 20.0
+                                # Also avoid shutdown while there's recent activity (e.g., /view streaming)
+                                try:
+                                    ACTIVE_WINDOW = float(os.environ.get("ACTIVE_STREAM_WINDOW", "10"))
+                                except Exception:
+                                    ACTIVE_WINDOW = 10.0
+                                now = time.time()
+                                if (now - self.last_activity) < ACTIVE_WINDOW:
+                                    continue
+                                if self.last_completed_at > 0 and (now - self.last_completed_at) < MIN_WAIT:
+                                    continue
+                                # Be conservative: if we have any recently completed jobs without an explicit
+                                # import ACK, require either artifact downloads or grace expiry — even when
+                                # the artifact list is empty (enumeration may lag).
+                                ready = True
+                                try:
+                                    # If there are completed jobs, require ACK or downloads or grace expiry
+                                    if job_completed_at:
+                                        for jid, when in list(job_completed_at.items()):
+                                            if jid in jobs_imported_ack:
+                                                continue
+                                            arts = job_artifacts.get(jid, [])
+                                            # If we have no artifact enumeration yet, wait for grace window
+                                            if not arts and (now - when) < GRACE:
+                                                ready = False
+                                            else:
+                                                for name in arts:
+                                                    if name not in downloads_seen and (now - when) < GRACE:
+                                                        ready = False
+                                                        break
+                                            if not ready:
+                                                break
+                                except Exception:
+                                    # On error, do not shut down aggressively
+                                    ready = False
+                                if ready:
+                                    print("[SHUTDOWN] No active jobs/clients, uploads done — ACK/grace satisfied; shutting down", flush=True)
+                                    os._exit(0)
+                                else:
+                                    remain = 0
+                                    try:
+                                        if job_completed_at:
+                                            remain = int(max(0.0, GRACE - min((now - t) for t in job_completed_at.values())))
+                                    except Exception:
+                                        remain = 0
+                                    print(f"[SHUTDOWN] Awaiting client imports/ACK (ws=0) grace≈{remain}s", flush=True)
+                                    continue
+                            else:
+                                # There are WS clients connected; keep container alive
+                                print(f"[SHUTDOWN] Still active: jobs={len(self.active_jobs)} uploads={self.uploads_in_progress} (ws_clients={self.ws_clients})", flush=True)
+                                continue
                         elif len(self.active_jobs) > 0 or self.uploads_in_progress > 0:
                             print(f"[SHUTDOWN] Still active: jobs={len(self.active_jobs)} uploads={self.uploads_in_progress} (ws_clients={self.ws_clients})", flush=True)
                         else:
@@ -1512,6 +1940,7 @@ def comfyui():
             self.active_jobs.discard(job_id)
             self.completed_jobs.add(job_id)
             self.last_activity = time.time()
+            self.last_completed_at = time.time()
             
             print(f"[JOBS] Job completed: {job_id} (active: {len(self.active_jobs)})", flush=True)
             
@@ -1612,6 +2041,20 @@ def comfyui():
                         queue_running = queue_data.get("queue_running", [])
 
                         if len(queue_pending) == 0 and len(queue_running) == 0:
+                            # Enforce minimum wait and active stream windows here as well
+                            try:
+                                MIN_WAIT = float(os.environ.get("IMPORT_WAIT_SECONDS", "20"))
+                            except Exception:
+                                MIN_WAIT = 20.0
+                            try:
+                                ACTIVE_WINDOW = float(os.environ.get("ACTIVE_STREAM_WINDOW", "10"))
+                            except Exception:
+                                ACTIVE_WINDOW = 10.0
+                            now = time.time()
+                            if (now - job_manager_instance.last_activity) < ACTIVE_WINDOW:
+                                continue
+                            if job_manager_instance.last_completed_at > 0 and (now - job_manager_instance.last_completed_at) < MIN_WAIT:
+                                continue
                             # Do not shut down if any persisted job indicates running recently
                             try:
                                 import json as _j
@@ -1816,10 +2259,23 @@ def comfyui():
         base = str(request.base_url).rstrip("/")
         outs = []
         try:
-            for f in sorted(Path("/outputs").glob("*.mp4"), key=lambda p: p.stat().st_mtime, reverse=True)[:10]:
-                name = f.name
-                url = f"{base}/view?filename={name}"
-                outs.append({"filename": name, "url": url})
+            out_dir = Path("/outputs")
+            # List most recent MP4s recursively and return their relative path for /view
+            candidates = []
+            for f in out_dir.rglob("*.mp4"):
+                try:
+                    st = f.stat()
+                except Exception:
+                    continue
+                candidates.append((f, st.st_mtime))
+            candidates.sort(key=lambda x: x[1], reverse=True)
+            for f, _ in candidates[:10]:
+                try:
+                    rel = f.relative_to(out_dir).as_posix()
+                except Exception:
+                    rel = f.name
+                url = f"{base}/view?filename={rel}"
+                outs.append({"filename": rel, "url": url})
         except Exception:
             pass
         ws = base.replace("https://", "wss://", 1).replace("http://", "ws://", 1) + "/events"
@@ -1966,10 +2422,18 @@ def comfyui():
                 media_type="application/json",
             )
         
-        # Track job start
+        # Track job start; ensure a client_id exists and is forwarded to ComfyUI
         job_id = req.get("client_id", f"job_{int(time.time())}")
         print(f"[DEBUG] Tracking job with ID: {job_id}", flush=True)
         job_manager.job_started(job_id)
+        # If the incoming body lacked a usable client_id, inject one so ComfyUI
+        # produces progress on the same channel the monitor subscribes to.
+        try:
+            cid = req.get('client_id')
+            if not isinstance(cid, str) or not cid.strip():
+                req['client_id'] = str(job_id)
+        except Exception:
+            pass
 
         # Accept either a full request {prompt: {...}} or a raw graph map as body
         p = req.get("prompt", None)
@@ -2136,6 +2600,13 @@ def comfyui():
         # Capture/ensure filename prefix from graph for artifact filtering/uniqueness
         try:
             expect_prefix = None
+            # Compute a short job-scoped suffix for filenames
+            def _short_id(s: str) -> str:
+                try:
+                    return (s or "")[:8]
+                except Exception:
+                    return (str(s) or "")[:8]
+            suffix = _short_id(str(job_id))
             for _nid, node in (p or {}).items():
                 if not isinstance(node, dict):
                     continue
@@ -2144,11 +2615,14 @@ def comfyui():
                     ins = node.get('inputs') or {}
                     fp = ins.get('filename_prefix')
                     if isinstance(fp, str) and fp.strip():
-                        expect_prefix = fp.strip()
-                        break
+                        # Respect the client-provided prefix as-is. Do not append job-scoped suffixes.
+                        # This keeps the prefix consistent with what the desktop app expects.
+                        base = fp.strip()
+                        expect_prefix = base
+                        # do not break; allow more nodes to be normalized below
             if not expect_prefix:
                 # Default to client-provided id to avoid cross-job collisions
-                expect_prefix = str(job_id)
+                expect_prefix = f"{_short_id(str(job_id))}"
                 # Patch the graph inline to ensure downstream filenames are prefixed uniquely
                 for _nid, node in (p or {}).items():
                     if not isinstance(node, dict):
@@ -2163,6 +2637,21 @@ def comfyui():
                 req['prompt'] = p
             if expect_prefix:
                 job_prefixes[str(job_id)] = expect_prefix
+                # Ensure all relevant nodes have the expected prefix
+                try:
+                    for _nid, node in (p or {}).items():
+                        if not isinstance(node, dict):
+                            continue
+                        ct = node.get('class_type')
+                        if ct in ('VHS_VideoCombine', 'VideoCombine', 'SaveVideo', 'SaveImage'):
+                            if not isinstance(node.get('inputs'), dict):
+                                node['inputs'] = {}
+                            fpv = node['inputs'].get('filename_prefix')
+                            if not isinstance(fpv, str) or not fpv.strip():
+                                node['inputs']['filename_prefix'] = expect_prefix
+                    req['prompt'] = p
+                except Exception:
+                    pass
         except Exception:
             pass
 
@@ -2300,6 +2789,68 @@ def comfyui():
 
         return StreamingResponse(file_iterator(file_path), media_type=content_type)
 
+    @api.get("/view/{pid}")
+    async def view_by_job(pid: str):
+        """Stream the first artifact for a given prompt/job id.
+        Fallbacks to most recent mp4 if no mapping is found.
+        """
+        from pathlib import Path as _P
+        from fastapi.responses import StreamingResponse
+        # Resolve artifact list
+        names = job_artifacts.get(pid) or []
+        if not names:
+            st = _read_job_state(pid) or {}
+            names = st.get('artifacts') or []
+        # Pick first mp4
+        rel = None
+        for n in names:
+            if isinstance(n, str) and n.lower().endswith('.mp4'):
+                rel = n
+                break
+        # As last resort, use the most recent mp4
+        base_dir = _P("/outputs")
+        if not rel:
+            try:
+                cands = []
+                for f in base_dir.rglob("*.mp4"):
+                    try:
+                        cands.append((f, f.stat().st_mtime))
+                    except Exception:
+                        pass
+                cands.sort(key=lambda x: x[1], reverse=True)
+                if cands:
+                    try:
+                        rel = cands[0][0].relative_to(base_dir).as_posix()
+                    except Exception:
+                        rel = cands[0][0].name
+            except Exception:
+                pass
+        if not rel:
+            return {"error": "No artifacts available for this job"}, 404
+        file_path = (base_dir / rel).resolve()
+        if not file_path.exists() or not file_path.is_file():
+            return {"error": f"File {rel} not found"}, 404
+        content_type = "video/mp4"
+        def file_iterator(path: _P, chunk_size: int = 1024 * 1024):
+            try:
+                with open(path, "rb") as f:
+                    while True:
+                        chunk = f.read(chunk_size)
+                        if not chunk:
+                            break
+                        try:
+                            job_manager.last_activity = time.time()
+                        except Exception:
+                            pass
+                        yield chunk
+                try:
+                    downloads_seen.add(rel)
+                except Exception:
+                    pass
+            except Exception:
+                raise
+        return StreamingResponse(file_iterator(file_path), media_type=content_type)
+
     @api.get("/jobs/{job_id}")
     async def get_job(job_id: str, request: Request):
         """Return job status/artifacts from persistent state, with in-memory fallback."""
@@ -2315,6 +2866,22 @@ def comfyui():
         # Fallback to memory if no persisted artifacts
         if not names:
             names = job_artifacts.get(job_id, [])
+        # If object_keys mapping is missing in state, try loading from S3 manifest
+        try:
+            has_keys = isinstance(state.get('object_keys'), dict) and bool(state.get('object_keys'))
+        except Exception:
+            has_keys = False
+        if not has_keys:
+            try:
+                manifest_map = _s3_read_manifest(job_id)
+                if manifest_map:
+                    state['object_keys'] = manifest_map
+                    try:
+                        _persist_job_state(job_id, {'object_keys': manifest_map})
+                    except Exception:
+                        pass
+            except Exception:
+                pass
         arts = []
         for name in names:
             if not isinstance(name, str) or not name:
@@ -2322,7 +2889,15 @@ def comfyui():
             # Prefer presigned S3 URL if we have an object key
             url = None
             try:
-                key = (job_object_keys.get(job_id) or {}).get(name)
+                # Look up persisted mapping first (survives cold starts)
+                key = None
+                try:
+                    objmap = state.get('object_keys') if isinstance(state.get('object_keys'), dict) else {}
+                    key = objmap.get(name)
+                except Exception:
+                    key = None
+                if not key:
+                    key = (job_object_keys.get(job_id) or {}).get(name)
             except Exception:
                 key = None
             if key:
@@ -2339,12 +2914,25 @@ def comfyui():
             if not url:
                 url = f"{base}/view?filename={name}"
             arts.append({"filename": name, "url": url})
-        # If completed but no artifact list, try scanning outputs directory for recent files
+        # If completed but no artifact list, try scanning outputs directory for recent files (recursive)
         if status == 'completed' and not arts:
             try:
                 from pathlib import Path as _P
-                for f in sorted(_P("/outputs").glob("*.mp4"), key=lambda p: p.stat().st_mtime, reverse=True)[:3]:
-                    arts.append({"filename": f.name, "url": f"{base}/view?filename={f.name}"})
+                out_dir = _P("/outputs")
+                cands = []
+                for f in out_dir.rglob("*.mp4"):
+                    try:
+                        st = f.stat()
+                    except Exception:
+                        continue
+                    cands.append((f, st.st_mtime))
+                cands.sort(key=lambda x: x[1], reverse=True)
+                for f, _ in cands[:3]:
+                    try:
+                        rel = f.relative_to(out_dir).as_posix()
+                    except Exception:
+                        rel = f.name
+                    arts.append({"filename": rel, "url": f"{base}/view?filename={rel}"})
             except Exception:
                 pass
         resp = {"id": job_id, "status": status, "artifacts": arts}
@@ -2355,6 +2943,58 @@ def comfyui():
         if tot is not None:
             resp["total_steps"] = tot
         return resp
+
+    @api.get("/artifacts/{job_id}")
+    async def artifacts(job_id: str):
+        """Return presigned Backblaze/S3 URLs for artifacts for the given job id.
+        Reads an S3 manifest first (cross-replica, survives cold starts),
+        then falls back to persisted state (object_keys) if the manifest is missing.
+        Returns { id, artifacts: [{ filename, url }] }.
+        """
+        try:
+            import boto3
+        except Exception:
+            boto3 = None
+        # Load manifest map first
+        mp = _s3_read_manifest(job_id) or {}
+        # Fall back to persisted state if manifest missing
+        if not mp:
+            st = _read_job_state(job_id) or {}
+            if isinstance(st.get('object_keys'), dict):
+                mp = st.get('object_keys') or {}
+        # Nothing to return
+        if not mp:
+            return {"id": job_id, "artifacts": []}
+        # Presign each
+        try:
+            expire = int(os.environ.get("ARTIFACT_URL_EXPIRE", "86400"))
+        except Exception:
+            expire = 86400
+        region = os.environ.get("S3_REGION") or os.environ.get("AWS_REGION")
+        endpoint = os.environ.get("S3_ENDPOINT")
+        bucket = os.environ.get("S3_BUCKET")
+        urls = []
+        s3 = _s3_client_for_env()
+        for name, key in mp.items():
+            if not isinstance(name, str) or not isinstance(key, str):
+                continue
+            url = None
+            # Try presign if possible
+            try:
+                if s3 is not None:
+                    url = s3.generate_presigned_url(
+                        "get_object",
+                        Params={"Bucket": bucket, "Key": key},
+                        ExpiresIn=expire,
+                    )
+            except Exception:
+                url = None
+            # As a fallback, attempt a public URL format if Backblaze public bucket is used
+            if not url and endpoint and "backblazeb2.com" in endpoint:
+                url = _generate_public_url(bucket, key, endpoint, region)
+            if url:
+                urls.append({"filename": name, "url": url})
+        return {"id": job_id, "artifacts": urls}
 
     @api.post("/jobs/{job_id}/imported")
     async def mark_imported(job_id: str, request: Request):
@@ -2375,7 +3015,10 @@ def comfyui():
                 return Response(status_code=401)
             # Mark ACK
             try:
-                jobs_imported_ack.add(str(job_id))
+                related = {str(job_id)}
+                related.update(job_aliases.get(str(job_id), set()))
+                for rid in related:
+                    jobs_imported_ack.add(rid)
             except Exception:
                 pass
             # Optionally mark specific files as downloaded
@@ -2395,6 +3038,20 @@ def comfyui():
                 job_manager.last_activity = time.time()
             except Exception:
                 pass
+            try:
+                should_close = False
+                related = {str(job_id)}
+                related.update(job_aliases.get(str(job_id), set()))
+                for rid in related:
+                    if rid in jobs_ready_for_close:
+                        should_close = True
+                        jobs_ready_for_close.discard(rid)
+                if should_close:
+                    _publish_ws_event({"type": "job_imported", "job_id": str(job_id)})
+                    _publish_ws_event({"type": "server_idle_close"})
+                    close_all_ws()
+            except Exception as exc:
+                print(f"[WS] close after import failed: {exc}", flush=True)
             return {"ok": True}
         except Exception:
             return Response(status_code=500)

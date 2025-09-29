@@ -33,10 +33,7 @@ fn main() {
     }
     let window = WindowBuilder::new()
         .with_title(args.title)
-        .with_inner_size(LogicalSize::new(
-            args.width as f64,
-            args.height as f64,
-        ))
+        .with_inner_size(LogicalSize::new(args.width as f64, args.height as f64))
         .build(&event_loop)
         .expect("failed to create window");
 

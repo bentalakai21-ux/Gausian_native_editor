@@ -1,11 +1,11 @@
+use project::app_data_dir;
 use std::io::{BufRead, BufReader};
-use std::net::{TcpStream, ToSocketAddrs};
+use std::net::{TcpListener, TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
-use project::app_data_dir;
 
 #[derive(Clone, Debug, Default)]
 pub struct PipConfig {
@@ -27,8 +27,19 @@ pub struct ComfyUiConfig {
 
 impl Default for ComfyUiConfig {
     fn default() -> Self {
-        let python_cmd = if cfg!(target_os = "windows") { "python" } else { "python3" }.to_string();
-        Self { repo_path: None, python_cmd, host: "127.0.0.1".into(), port: 8188, https: false }
+        let python_cmd = if cfg!(target_os = "windows") {
+            "python"
+        } else {
+            "python3"
+        }
+        .to_string();
+        Self {
+            repo_path: None,
+            python_cmd,
+            host: "127.0.0.1".into(),
+            port: 8188,
+            https: false,
+        }
     }
 }
 
@@ -49,7 +60,11 @@ pub enum TorchBackend {
     Cpu,
 }
 
-impl Default for TorchBackend { fn default() -> Self { TorchBackend::Auto } }
+impl Default for TorchBackend {
+    fn default() -> Self {
+        TorchBackend::Auto
+    }
+}
 
 #[derive(Clone, Debug, Default)]
 pub struct InstallerPlan {
@@ -77,7 +92,9 @@ pub struct ComfyUiManager {
 }
 
 impl Default for ComfyUiManager {
-    fn default() -> Self { Self::new(ComfyUiConfig::default()) }
+    fn default() -> Self {
+        Self::new(ComfyUiConfig::default())
+    }
 }
 
 impl ComfyUiManager {
@@ -95,8 +112,12 @@ impl ComfyUiManager {
         }
     }
 
-    pub fn config_mut(&mut self) -> &mut ComfyUiConfig { &mut self.cfg }
-    pub fn config(&self) -> &ComfyUiConfig { &self.cfg }
+    pub fn config_mut(&mut self) -> &mut ComfyUiConfig {
+        &mut self.cfg
+    }
+    pub fn config(&self) -> &ComfyUiConfig {
+        &self.cfg
+    }
 
     pub fn url(&self) -> String {
         let scheme = if self.cfg.https { "https" } else { "http" };
@@ -113,7 +134,11 @@ impl ComfyUiManager {
         } else {
             // Use python3 if present; python is fine too as venv shim
             let p3 = venv_dir.join("bin").join("python3");
-            if p3.exists() { p3 } else { venv_dir.join("bin").join("python") }
+            if p3.exists() {
+                p3
+            } else {
+                venv_dir.join("bin").join("python")
+            }
         }
     }
 
@@ -121,7 +146,11 @@ impl ComfyUiManager {
     fn find_repo_venv_python(repo: &Path) -> Option<PathBuf> {
         let vdir = repo.join(".venv");
         let vpy = Self::venv_python_path(&vdir);
-        if vpy.exists() { Some(vpy) } else { None }
+        if vpy.exists() {
+            Some(vpy)
+        } else {
+            None
+        }
     }
 
     pub fn is_port_open(&self) -> bool {
@@ -130,8 +159,37 @@ impl ComfyUiManager {
             .to_socket_addrs()
             .ok()
             .and_then(|mut it| it.next())
-            .and_then(|sockaddr| TcpStream::connect_timeout(&sockaddr, Duration::from_millis(150)).ok())
+            .and_then(|sockaddr| {
+                TcpStream::connect_timeout(&sockaddr, Duration::from_millis(150)).ok()
+            })
             .is_some()
+    }
+
+    fn server_responds(&self) -> bool {
+        // Best-effort probe to see if something is serving HTTP on the target URL
+        // This helps distinguish a running ComfyUI from an arbitrary listener.
+        // Keep timeouts short to avoid blocking UI.
+        let url = format!("{}/", self.url());
+        match ureq::get(&url).timeout(Duration::from_millis(700)).call() {
+            Ok(resp) => resp.status() < 500,
+            Err(_) => false,
+        }
+    }
+
+    fn find_free_port(start: u16, attempts: u16) -> Option<u16> {
+        let mut p = start.max(1024);
+        for _ in 0..attempts {
+            if let Ok(listener) = TcpListener::bind(("127.0.0.1", p)) {
+                // Successfully bound means it's free; drop immediately and use it.
+                drop(listener);
+                return Some(p);
+            }
+            p = p.saturating_add(1);
+            if p > 65535 {
+                p = 1024;
+            }
+        }
+        None
     }
 
     pub fn is_running(&mut self) -> bool {
@@ -148,7 +206,30 @@ impl ComfyUiManager {
     pub fn start(&mut self) {
         if self.is_running() {
             self.last_status = ComfyUiStatus::Running;
+            self.last_error = None;
             return;
+        }
+
+        // If the configured port is already in use, either reuse an existing ComfyUI
+        // or automatically switch to the next available port to avoid bind errors.
+        if self.is_port_open() {
+            if self.server_responds() {
+                self.log("Detected existing ComfyUI on configured port; reusing.");
+                self.last_status = ComfyUiStatus::Running;
+                self.last_error = None;
+                return;
+            } else if let Some(free) = Self::find_free_port(self.cfg.port.saturating_add(1), 200) {
+                let old = self.cfg.port;
+                self.cfg.port = free;
+                self.log(&format!(
+                    "Port {} is busy; switching to available port {}",
+                    old, free
+                ));
+            } else {
+                self.last_status = ComfyUiStatus::Error;
+                self.last_error = Some("No free local ports found (range scanned)".into());
+                return;
+            }
         }
 
         self.last_status = ComfyUiStatus::Starting;
@@ -187,7 +268,9 @@ impl ComfyUiManager {
                     thread::spawn(move || {
                         let reader = BufReader::new(out);
                         for line in reader.lines().flatten() {
-                            if let Ok(mut b) = log_buf.lock() { b.push(format!("[O] {}", line)); }
+                            if let Ok(mut b) = log_buf.lock() {
+                                b.push(format!("[O] {}", line));
+                            }
                         }
                     });
                 }
@@ -196,7 +279,9 @@ impl ComfyUiManager {
                     thread::spawn(move || {
                         let reader = BufReader::new(err);
                         for line in reader.lines().flatten() {
-                            if let Ok(mut b) = log_buf.lock() { b.push(format!("[E] {}", line)); }
+                            if let Ok(mut b) = log_buf.lock() {
+                                b.push(format!("[E] {}", line));
+                            }
                         }
                     });
                 }
@@ -205,10 +290,16 @@ impl ComfyUiManager {
                 // Poll port readiness briefly
                 let deadline = Instant::now() + Duration::from_secs(8);
                 while Instant::now() < deadline {
-                    if self.is_port_open() { break; }
+                    if self.is_port_open() {
+                        break;
+                    }
                     thread::sleep(Duration::from_millis(150));
                 }
-                self.last_status = if self.is_running() { ComfyUiStatus::Running } else { ComfyUiStatus::Starting };
+                self.last_status = if self.is_running() {
+                    ComfyUiStatus::Running
+                } else {
+                    ComfyUiStatus::Starting
+                };
             }
             Err(e) => {
                 self.last_status = ComfyUiStatus::Error;
@@ -236,8 +327,10 @@ impl ComfyUiManager {
         // Try to spawn the helper binary if it's in PATH; fall back to system browser.
         let url = self.url();
         if Command::new("comfywebview")
-            .arg("--url").arg(&url)
-            .arg("--title").arg("ComfyUI")
+            .arg("--url")
+            .arg(&url)
+            .arg("--title")
+            .arg("ComfyUI")
             .spawn()
             .is_err()
         {
@@ -245,15 +338,33 @@ impl ComfyUiManager {
         }
     }
 
-    fn log(&self, s: impl Into<String>) { if let Ok(mut b) = self.log_buf.lock() { b.push(s.into()); } }
+    fn log(&self, s: impl Into<String>) {
+        if let Ok(mut b) = self.log_buf.lock() {
+            b.push(s.into());
+        }
+    }
 
     fn apply_pip_config<'a>(base: &[&'a str], pip: &PipConfig) -> Vec<String> {
         let mut v: Vec<String> = base.iter().map(|s| s.to_string()).collect();
-        if let Some(ix) = &pip.index_url { v.push("-i".into()); v.push(ix.clone()); }
-        if let Some(ex) = &pip.extra_index_url { v.push("--extra-index-url".into()); v.push(ex.clone()); }
-        for h in &pip.trusted_hosts { v.push("--trusted-host".into()); v.push(h.clone()); }
-        if let Some(p) = &pip.proxy { v.push("--proxy".into()); v.push(p.clone()); }
-        if pip.no_cache { v.push("--no-cache-dir".into()); }
+        if let Some(ix) = &pip.index_url {
+            v.push("-i".into());
+            v.push(ix.clone());
+        }
+        if let Some(ex) = &pip.extra_index_url {
+            v.push("--extra-index-url".into());
+            v.push(ex.clone());
+        }
+        for h in &pip.trusted_hosts {
+            v.push("--trusted-host".into());
+            v.push(h.clone());
+        }
+        if let Some(p) = &pip.proxy {
+            v.push("--proxy".into());
+            v.push(p.clone());
+        }
+        if pip.no_cache {
+            v.push("--no-cache-dir".into());
+        }
         v
     }
 
@@ -265,16 +376,46 @@ impl ComfyUiManager {
                     vec!["torch", "torchvision", "torchaudio"]
                 } else if cfg!(target_os = "windows") {
                     // Default to CUDA 12.1 build; users without NVIDIA will fall back later
-                    vec!["--index-url", "https://download.pytorch.org/whl/cu121", "torch", "torchvision", "torchaudio"]
+                    vec![
+                        "--index-url",
+                        "https://download.pytorch.org/whl/cu121",
+                        "torch",
+                        "torchvision",
+                        "torchaudio",
+                    ]
                 } else {
                     // Linux: default to CPU to avoid driver mismatch surprises; users can pick CUDA/ROCm explicitly
-                    vec!["--index-url", "https://download.pytorch.org/whl/cpu", "torch", "torchvision", "torchaudio"]
+                    vec![
+                        "--index-url",
+                        "https://download.pytorch.org/whl/cpu",
+                        "torch",
+                        "torchvision",
+                        "torchaudio",
+                    ]
                 }
             }
-            TorchBackend::Cuda => vec!["--index-url", "https://download.pytorch.org/whl/cu121", "torch", "torchvision", "torchaudio"],
+            TorchBackend::Cuda => vec![
+                "--index-url",
+                "https://download.pytorch.org/whl/cu121",
+                "torch",
+                "torchvision",
+                "torchaudio",
+            ],
             TorchBackend::Mps => vec!["torch", "torchvision", "torchaudio"],
-            TorchBackend::Rocm => vec!["--index-url", "https://download.pytorch.org/whl/rocm5.6", "torch", "torchvision", "torchaudio"],
-            TorchBackend::Cpu => vec!["--index-url", "https://download.pytorch.org/whl/cpu", "torch", "torchvision", "torchaudio"],
+            TorchBackend::Rocm => vec![
+                "--index-url",
+                "https://download.pytorch.org/whl/rocm5.6",
+                "torch",
+                "torchvision",
+                "torchaudio",
+            ],
+            TorchBackend::Cpu => vec![
+                "--index-url",
+                "https://download.pytorch.org/whl/cpu",
+                "torch",
+                "torchvision",
+                "torchaudio",
+            ],
         }
     }
 
@@ -282,7 +423,9 @@ impl ComfyUiManager {
         // Spawn a thread for the install so UI stays responsive.
         let log_buf = self.log_buf.clone();
         let mut plan = plan.clone();
-        if plan.install_dir.is_none() { plan.install_dir = Some(Self::default_install_dir()); }
+        if plan.install_dir.is_none() {
+            plan.install_dir = Some(Self::default_install_dir());
+        }
         let install_dir = plan.install_dir.unwrap();
         // Record intended install directory immediately so subsequent actions (e.g., Validate/Use Installed)
         // know where to look even before the background thread finishes.
@@ -293,24 +436,38 @@ impl ComfyUiManager {
         let pip_cfg = plan.pip.clone();
         let want_ffmpeg = plan.install_ffmpeg;
         thread::spawn(move || {
-            let log = |s: &str| { if let Ok(mut b) = log_buf.lock() { b.push(s.to_string()); } };
+            let log = |s: &str| {
+                if let Ok(mut b) = log_buf.lock() {
+                    b.push(s.to_string());
+                }
+            };
             let run = |program: &str, args: &[&str], cwd: Option<&Path>| -> std::io::Result<i32> {
                 log(&format!("$ {} {}", program, args.join(" ")));
                 let mut c = Command::new(program);
                 c.args(args);
-                if let Some(d) = cwd { c.current_dir(d); }
+                if let Some(d) = cwd {
+                    c.current_dir(d);
+                }
                 c.stdout(Stdio::piped()).stderr(Stdio::piped());
                 let mut child = c.spawn()?;
                 if let Some(out) = child.stdout.take() {
                     let lb = log_buf.clone();
                     thread::spawn(move || {
-                        for l in BufReader::new(out).lines().flatten() { if let Ok(mut b) = lb.lock() { b.push(format!("[O] {}", l)); } }
+                        for l in BufReader::new(out).lines().flatten() {
+                            if let Ok(mut b) = lb.lock() {
+                                b.push(format!("[O] {}", l));
+                            }
+                        }
                     });
                 }
                 if let Some(err) = child.stderr.take() {
                     let lb = log_buf.clone();
                     thread::spawn(move || {
-                        for l in BufReader::new(err).lines().flatten() { if let Ok(mut b) = lb.lock() { b.push(format!("[E] {}", l)); } }
+                        for l in BufReader::new(err).lines().flatten() {
+                            if let Ok(mut b) = lb.lock() {
+                                b.push(format!("[E] {}", l));
+                            }
+                        }
                     });
                 }
                 let status = child.wait()?;
@@ -323,15 +480,28 @@ impl ComfyUiManager {
             // Clone if main.py missing
             let has_main = install_dir.join("main.py").exists();
             if !has_main {
-                let code = run("git", &["clone", "https://github.com/comfyanonymous/ComfyUI", install_dir.to_string_lossy().as_ref()], None)
-                    .unwrap_or(-1);
-                if code != 0 { log("git clone failed"); return; }
+                let code = run(
+                    "git",
+                    &[
+                        "clone",
+                        "https://github.com/comfyanonymous/ComfyUI",
+                        install_dir.to_string_lossy().as_ref(),
+                    ],
+                    None,
+                )
+                .unwrap_or(-1);
+                if code != 0 {
+                    log("git clone failed");
+                    return;
+                }
             }
             // Checkout pinned ref if provided
             if let Some(r) = pinned_ref.as_deref() {
                 let _ = run("git", &["fetch", "--all"], Some(&install_dir));
                 let code = run("git", &["checkout", r], Some(&install_dir)).unwrap_or(-1);
-                if code != 0 { log("git checkout failed"); }
+                if code != 0 {
+                    log("git checkout failed");
+                }
             }
 
             // Create venv if missing
@@ -347,7 +517,9 @@ impl ComfyUiManager {
                     let mut prog = "python".to_string();
                     // If user configured a specific python, try it first
                     if let Some(p) = plan.python_for_venv.as_ref() {
-                        if !p.trim().is_empty() { prog = p.clone(); }
+                        if !p.trim().is_empty() {
+                            prog = p.clone();
+                        }
                     } else if !mgr.cfg.python_cmd.trim().is_empty() {
                         prog = mgr.cfg.python_cmd.clone();
                     }
@@ -356,8 +528,14 @@ impl ComfyUiManager {
                 #[cfg(not(target_os = "windows"))]
                 let (venv_prog, venv_prefix): (String, Vec<&str>) = {
                     let mut candidates: Vec<String> = Vec::new();
-                    if let Some(p) = plan.python_for_venv.as_ref() { if !p.trim().is_empty() { candidates.push(p.clone()); } }
-                    if !mgr.cfg.python_cmd.trim().is_empty() { candidates.push(mgr.cfg.python_cmd.clone()); }
+                    if let Some(p) = plan.python_for_venv.as_ref() {
+                        if !p.trim().is_empty() {
+                            candidates.push(p.clone());
+                        }
+                    }
+                    if !mgr.cfg.python_cmd.trim().is_empty() {
+                        candidates.push(mgr.cfg.python_cmd.clone());
+                    }
                     candidates.extend([
                         "python3.12".to_string(),
                         "python3.11".to_string(),
@@ -367,13 +545,21 @@ impl ComfyUiManager {
                     ]);
                     let mut chosen = None;
                     for c in candidates.into_iter() {
-                        if let Ok(out) = std::process::Command::new(&c).arg("-c").arg("import sys; print(f'{sys.version_info[0]}.{sys.version_info[1]}')").output() {
+                        if let Ok(out) = std::process::Command::new(&c)
+                            .arg("-c")
+                            .arg(
+                                "import sys; print(f'{sys.version_info[0]}.{sys.version_info[1]}')",
+                            )
+                            .output()
+                        {
                             if out.status.success() {
                                 if let Ok(s) = String::from_utf8(out.stdout) {
                                     let s = s.trim();
                                     let parts: Vec<_> = s.split('.').collect();
                                     if parts.len() >= 2 {
-                                        if let (Ok(maj), Ok(min)) = (parts[0].parse::<i32>(), parts[1].parse::<i32>()) {
+                                        if let (Ok(maj), Ok(min)) =
+                                            (parts[0].parse::<i32>(), parts[1].parse::<i32>())
+                                        {
                                             if maj == 3 && (10..=12).contains(&min) {
                                                 chosen = Some(c);
                                                 break;
@@ -390,7 +576,10 @@ impl ComfyUiManager {
                 args.extend(venv_prefix.iter().copied());
                 args.extend(["-m", "venv", ".venv"].iter().copied());
                 let code = run(&venv_prog, &args, Some(&install_dir)).unwrap_or(-1);
-                if code != 0 { log("venv creation failed"); return; }
+                if code != 0 {
+                    log("venv creation failed");
+                    return;
+                }
             } else {
                 log("Reusing existing virtual environment (.venv)");
             }
@@ -400,13 +589,19 @@ impl ComfyUiManager {
                 return;
             }
             // Warn if Python is unsupported for torch (e.g., 3.13+)
-            if let Ok(out) = std::process::Command::new(&vpy).arg("-c").arg("import sys; print(f'{sys.version_info[0]}.{sys.version_info[1]}')").output() {
+            if let Ok(out) = std::process::Command::new(&vpy)
+                .arg("-c")
+                .arg("import sys; print(f'{sys.version_info[0]}.{sys.version_info[1]}')")
+                .output()
+            {
                 if out.status.success() {
                     if let Ok(s) = String::from_utf8(out.stdout) {
                         let s = s.trim();
                         let parts: Vec<_> = s.split('.').collect();
                         if parts.len() >= 2 {
-                            if let (Ok(maj), Ok(min)) = (parts[0].parse::<i32>(), parts[1].parse::<i32>()) {
+                            if let (Ok(maj), Ok(min)) =
+                                (parts[0].parse::<i32>(), parts[1].parse::<i32>())
+                            {
                                 if !(maj == 3 && (10..=12).contains(&min)) {
                                     log("Warning: Python version is not in 3.10–3.12; PyTorch wheels may be unavailable.");
                                 }
@@ -416,43 +611,96 @@ impl ComfyUiManager {
                 }
             }
             // Upgrade pip/setuptools/wheel (allow slower networks) with configured indexes
-            let up_base = ["-m", "pip", "install", "--upgrade", "pip", "setuptools", "wheel", "--timeout", "60"];
+            let up_base = [
+                "-m",
+                "pip",
+                "install",
+                "--upgrade",
+                "pip",
+                "setuptools",
+                "wheel",
+                "--timeout",
+                "60",
+            ];
             let up_args = ComfyUiManager::apply_pip_config(&up_base, &pip_cfg);
             let up_args_str: Vec<&str> = up_args.iter().map(|s| s.as_str()).collect();
-            let _ = run(vpy.to_string_lossy().as_ref(), &up_args_str, Some(&install_dir));
+            let _ = run(
+                vpy.to_string_lossy().as_ref(),
+                &up_args_str,
+                Some(&install_dir),
+            );
             // Install torch (selected backend)
             // Torch install: if user provided index_url, prefer it over backend defaults
-            let mut torch: Vec<String> = ComfyUiManager::apply_pip_config(&["-m","pip","install","--timeout","90"], &pip_cfg);
+            let mut torch: Vec<String> = ComfyUiManager::apply_pip_config(
+                &["-m", "pip", "install", "--timeout", "90"],
+                &pip_cfg,
+            );
             if pip_cfg.index_url.is_none() && pip_cfg.extra_index_url.is_none() {
                 let args = Self::torch_args(torch_backend);
-                for a in args { torch.push(a.to_string()); }
+                for a in args {
+                    torch.push(a.to_string());
+                }
             } else {
-                torch.push("torch".into()); torch.push("torchvision".into()); torch.push("torchaudio".into());
+                torch.push("torch".into());
+                torch.push("torchvision".into());
+                torch.push("torchaudio".into());
             }
             let torch_args: Vec<&str> = torch.iter().map(|s| s.as_str()).collect();
-            let torch_code = run(vpy.to_string_lossy().as_ref(), &torch_args, Some(&install_dir)).unwrap_or(-1);
+            let torch_code = run(
+                vpy.to_string_lossy().as_ref(),
+                &torch_args,
+                Some(&install_dir),
+            )
+            .unwrap_or(-1);
             if torch_code != 0 {
                 log("Torch install failed. If using Python 3.13+, please switch to Python 3.11/3.12 and re-run Install.");
                 // Fallback attempt to CPU wheels if not already CPU
                 if !matches!(torch_backend, TorchBackend::Cpu) {
                     log("Falling back to CPU torch wheels...");
-                    let mut torch_cpu: Vec<String> = ComfyUiManager::apply_pip_config(&["-m","pip","install","--timeout","90"], &pip_cfg);
-                    let args = Self::torch_args(TorchBackend::Cpu); for a in args { torch_cpu.push(a.to_string()); }
+                    let mut torch_cpu: Vec<String> = ComfyUiManager::apply_pip_config(
+                        &["-m", "pip", "install", "--timeout", "90"],
+                        &pip_cfg,
+                    );
+                    let args = Self::torch_args(TorchBackend::Cpu);
+                    for a in args {
+                        torch_cpu.push(a.to_string());
+                    }
                     let torch_cpu_args: Vec<&str> = torch_cpu.iter().map(|s| s.as_str()).collect();
-                    let _ = run(vpy.to_string_lossy().as_ref(), &torch_cpu_args, Some(&install_dir));
+                    let _ = run(
+                        vpy.to_string_lossy().as_ref(),
+                        &torch_cpu_args,
+                        Some(&install_dir),
+                    );
                 }
             }
             // Install ComfyUI requirements with a retry (common network hiccups)
-            let req_base = ["-m", "pip", "install", "-r", "requirements.txt", "--timeout", "90"];
+            let req_base = [
+                "-m",
+                "pip",
+                "install",
+                "-r",
+                "requirements.txt",
+                "--timeout",
+                "90",
+            ];
             let req_args_s = ComfyUiManager::apply_pip_config(&req_base, &pip_cfg);
             let req_args: Vec<&str> = req_args_s.iter().map(|s| s.as_str()).collect();
-            let code = run(vpy.to_string_lossy().as_ref(), &req_args, Some(&install_dir)).unwrap_or(-1);
+            let code = run(
+                vpy.to_string_lossy().as_ref(),
+                &req_args,
+                Some(&install_dir),
+            )
+            .unwrap_or(-1);
             if code != 0 {
                 log("requirements install failed; retrying once...");
-                let _ = run(vpy.to_string_lossy().as_ref(), &req_args, Some(&install_dir));
+                let _ = run(
+                    vpy.to_string_lossy().as_ref(),
+                    &req_args,
+                    Some(&install_dir),
+                );
             }
             // Ensure commonly-missed extras present
-            let py_base = ["-m","pip","install","pyyaml","--timeout","60"];
+            let py_base = ["-m", "pip", "install", "pyyaml", "--timeout", "60"];
             let py_args_s = ComfyUiManager::apply_pip_config(&py_base, &pip_cfg);
             let py_args: Vec<&str> = py_args_s.iter().map(|s| s.as_str()).collect();
             let _ = run(vpy.to_string_lossy().as_ref(), &py_args, Some(&install_dir));
@@ -470,7 +718,8 @@ impl ComfyUiManager {
                 if let Some(out) = child.stdout.take() {
                     for l in BufReader::new(out).lines().flatten() {
                         if l.contains("yaml_missing") {
-                            let _ = run(vpy.to_string_lossy().as_ref(), &py_args, Some(&install_dir));
+                            let _ =
+                                run(vpy.to_string_lossy().as_ref(), &py_args, Some(&install_dir));
                         }
                     }
                 }
@@ -497,8 +746,11 @@ impl ComfyUiManager {
                         if brew_ok {
                             let _ = run("brew", &["update"], None);
                             let code = run("brew", &["install", "ffmpeg"], None).unwrap_or(-1);
-                            if code == 0 { log("FFmpeg installed via Homebrew"); }
-                            else { log("Homebrew install failed; please install FFmpeg manually") }
+                            if code == 0 {
+                                log("FFmpeg installed via Homebrew");
+                            } else {
+                                log("Homebrew install failed; please install FFmpeg manually")
+                            }
                         } else {
                             log("Homebrew not found; install it from https://brew.sh or install FFmpeg manually from https://ffmpeg.org");
                         }
@@ -511,28 +763,60 @@ impl ComfyUiManager {
                             .map(|o| o.status.success())
                             .unwrap_or(false);
                         if winget_ok {
-                            let mut ok = run("winget", &["install", "--id=FFmpeg.FFmpeg", "-e", "--source", "winget"], None).unwrap_or(-1) == 0;
+                            let mut ok = run(
+                                "winget",
+                                &["install", "--id=FFmpeg.FFmpeg", "-e", "--source", "winget"],
+                                None,
+                            )
+                            .unwrap_or(-1)
+                                == 0;
                             if !ok {
-                                ok = run("winget", &["install", "--id=Gyan.FFmpeg", "-e", "--source", "winget"], None).unwrap_or(-1) == 0;
+                                ok = run(
+                                    "winget",
+                                    &["install", "--id=Gyan.FFmpeg", "-e", "--source", "winget"],
+                                    None,
+                                )
+                                .unwrap_or(-1)
+                                    == 0;
                             }
-                            if ok { log("FFmpeg installed via winget"); } else { log("winget install failed; trying other managers or install manually"); }
+                            if ok {
+                                log("FFmpeg installed via winget");
+                            } else {
+                                log("winget install failed; trying other managers or install manually");
+                            }
                         } else {
-                            let choco_ok = std::process::Command::new("choco").arg("-v").output().map(|o| o.status.success()).unwrap_or(false);
+                            let choco_ok = std::process::Command::new("choco")
+                                .arg("-v")
+                                .output()
+                                .map(|o| o.status.success())
+                                .unwrap_or(false);
                             if choco_ok {
                                 let _ = run("choco", &["install", "ffmpeg", "-y"], None);
                             } else {
-                                let scoop_ok = std::process::Command::new("scoop").arg("-v").output().map(|o| o.status.success()).unwrap_or(false);
-                                if scoop_ok { let _ = run("scoop", &["install", "ffmpeg"], None); }
-                                else { log("No package manager found (winget/choco/scoop). Please install FFmpeg from https://ffmpeg.org"); }
+                                let scoop_ok = std::process::Command::new("scoop")
+                                    .arg("-v")
+                                    .output()
+                                    .map(|o| o.status.success())
+                                    .unwrap_or(false);
+                                if scoop_ok {
+                                    let _ = run("scoop", &["install", "ffmpeg"], None);
+                                } else {
+                                    log("No package manager found (winget/choco/scoop). Please install FFmpeg from https://ffmpeg.org");
+                                }
                             }
                         }
                     }
                     #[cfg(target_os = "linux")]
                     {
-                        let have = |cmd: &str| std::process::Command::new(cmd).arg("--version").output().map(|o| o.status.success()).unwrap_or(false);
-                        let try_sudo = |args: &[&str]| -> bool {
-                            run("sudo", args, None).unwrap_or(-1) == 0
+                        let have = |cmd: &str| {
+                            std::process::Command::new(cmd)
+                                .arg("--version")
+                                .output()
+                                .map(|o| o.status.success())
+                                .unwrap_or(false)
                         };
+                        let try_sudo =
+                            |args: &[&str]| -> bool { run("sudo", args, None).unwrap_or(-1) == 0 };
                         if have("ffprobe") {
                             // Installed meanwhile
                         } else if have("apt-get") {
@@ -559,7 +843,12 @@ impl ComfyUiManager {
 
     pub fn validate_install(&mut self) {
         // Validate current repo/python OR installed venv if available.
-        let repo = self.cfg.repo_path.clone().or(self.installed_dir.clone()).unwrap_or_else(|| Self::default_install_dir());
+        let repo = self
+            .cfg
+            .repo_path
+            .clone()
+            .or(self.installed_dir.clone())
+            .unwrap_or_else(|| Self::default_install_dir());
         // Prefer repo .venv python; then recorded venv_dir; otherwise configured python
         let py_path: String = if let Some(vpy) = Self::find_repo_venv_python(&repo) {
             vpy.to_string_lossy().to_string()
@@ -571,7 +860,11 @@ impl ComfyUiManager {
         let log_buf = self.log_buf.clone();
         let pip_cfg = self.last_pip.clone().unwrap_or_default();
         thread::spawn(move || {
-            let log = |s: &str| { if let Ok(mut b) = log_buf.lock() { b.push(s.to_string()); } };
+            let log = |s: &str| {
+                if let Ok(mut b) = log_buf.lock() {
+                    b.push(s.to_string());
+                }
+            };
             let mut c = Command::new(&py_path);
             c.current_dir(&repo)
                 .arg("-c")
@@ -582,13 +875,21 @@ impl ComfyUiManager {
                     if let Some(out) = child.stdout.take() {
                         let lb = log_buf.clone();
                         thread::spawn(move || {
-                            for l in BufReader::new(out).lines().flatten() { if let Ok(mut b) = lb.lock() { b.push(format!("[VAL] {}", l)); } }
+                            for l in BufReader::new(out).lines().flatten() {
+                                if let Ok(mut b) = lb.lock() {
+                                    b.push(format!("[VAL] {}", l));
+                                }
+                            }
                         });
                     }
                     if let Some(err) = child.stderr.take() {
                         let lb = log_buf.clone();
                         thread::spawn(move || {
-                            for l in BufReader::new(err).lines().flatten() { if let Ok(mut b) = lb.lock() { b.push(format!("[VAL-ERR] {}", l)); } }
+                            for l in BufReader::new(err).lines().flatten() {
+                                if let Ok(mut b) = lb.lock() {
+                                    b.push(format!("[VAL-ERR] {}", l));
+                                }
+                            }
                         });
                     }
                     let _ = child.wait();
@@ -600,22 +901,34 @@ impl ComfyUiManager {
             }
             // pip index versions torch
             let mut pip_cmd = Command::new(&py_path);
-            let base = ["-m","pip","index","versions","torch"];
+            let base = ["-m", "pip", "index", "versions", "torch"];
             let opts = ComfyUiManager::apply_pip_config(&base, &pip_cfg);
             let args: Vec<&str> = opts.iter().map(|s| s.as_str()).collect();
-            pip_cmd.current_dir(&repo).args(&args).stdout(Stdio::piped()).stderr(Stdio::piped());
+            pip_cmd
+                .current_dir(&repo)
+                .args(&args)
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
             match pip_cmd.spawn() {
                 Ok(mut child) => {
                     if let Some(out) = child.stdout.take() {
                         let lb = log_buf.clone();
                         thread::spawn(move || {
-                            for l in BufReader::new(out).lines().flatten() { if let Ok(mut b) = lb.lock() { b.push(format!("[PIP] {}", l)); } }
+                            for l in BufReader::new(out).lines().flatten() {
+                                if let Ok(mut b) = lb.lock() {
+                                    b.push(format!("[PIP] {}", l));
+                                }
+                            }
                         });
                     }
                     if let Some(err) = child.stderr.take() {
                         let lb = log_buf.clone();
                         thread::spawn(move || {
-                            for l in BufReader::new(err).lines().flatten() { if let Ok(mut b) = lb.lock() { b.push(format!("[PIP-ERR] {}", l)); } }
+                            for l in BufReader::new(err).lines().flatten() {
+                                if let Ok(mut b) = lb.lock() {
+                                    b.push(format!("[PIP-ERR] {}", l));
+                                }
+                            }
                         });
                     }
                     let _ = child.wait();
@@ -632,7 +945,9 @@ impl ComfyUiManager {
         let mut dir = self.installed_dir.clone();
         if dir.is_none() {
             let def = Self::default_install_dir();
-            if def.join("main.py").exists() { dir = Some(def); }
+            if def.join("main.py").exists() {
+                dir = Some(def);
+            }
         }
         if let Some(d) = dir.clone() {
             self.cfg.repo_path = Some(d.clone());
@@ -642,7 +957,9 @@ impl ComfyUiManager {
         if venv.is_none() {
             if let Some(d) = dir.as_ref() {
                 let v = d.join(".venv");
-                if Self::venv_python_path(&v).exists() { venv = Some(v); }
+                if Self::venv_python_path(&v).exists() {
+                    venv = Some(v);
+                }
             }
         }
         if let Some(v) = venv {
@@ -654,7 +971,12 @@ impl ComfyUiManager {
 
     pub fn repair_common_packages(&mut self) {
         // Check and install a common set of packages in the selected environment
-        let repo = self.cfg.repo_path.clone().or(self.installed_dir.clone()).unwrap_or_else(|| Self::default_install_dir());
+        let repo = self
+            .cfg
+            .repo_path
+            .clone()
+            .or(self.installed_dir.clone())
+            .unwrap_or_else(|| Self::default_install_dir());
         // Prefer repo .venv python; then recorded venv_dir; otherwise configured python
         let py_path: String = if let Some(vpy) = Self::find_repo_venv_python(&repo) {
             vpy.to_string_lossy().to_string()
@@ -666,7 +988,11 @@ impl ComfyUiManager {
         let log_buf = self.log_buf.clone();
         let pip_cfg = self.last_pip.clone().unwrap_or_default();
         thread::spawn(move || {
-            let log = |s: &str| { if let Ok(mut b) = log_buf.lock() { b.push(s.to_string()); } };
+            let log = |s: &str| {
+                if let Ok(mut b) = log_buf.lock() {
+                    b.push(s.to_string());
+                }
+            };
             let check_script = r#"
 missing = []
 mods = {
@@ -696,22 +1022,38 @@ print('MISSING:', ','.join(p for m,p in missing))
                     if let Some(l) = line {
                         let list = l.trim_start_matches("MISSING:").trim();
                         if !list.is_empty() {
-                            pkgs = list.split(',').filter(|s| !s.trim().is_empty()).map(|s| s.trim().to_string()).collect();
+                            pkgs = list
+                                .split(',')
+                                .filter(|s| !s.trim().is_empty())
+                                .map(|s| s.trim().to_string())
+                                .collect();
                         }
                     }
                     if pkgs.is_empty() {
                         log("Repair: no missing common packages detected");
                         return;
                     }
-                    log(&format!("Repair: installing missing packages: {}", pkgs.join(", ")));
+                    log(&format!(
+                        "Repair: installing missing packages: {}",
+                        pkgs.join(", ")
+                    ));
                     // pip install missing
                     let mut cmd = Command::new(&py_path);
-                    let mut args: Vec<String> = ComfyUiManager::apply_pip_config(&["-m","pip","install","--timeout","60"], &pip_cfg);
-                    for p in &pkgs { args.push(p.clone()); }
+                    let mut args: Vec<String> = ComfyUiManager::apply_pip_config(
+                        &["-m", "pip", "install", "--timeout", "60"],
+                        &pip_cfg,
+                    );
+                    for p in &pkgs {
+                        args.push(p.clone());
+                    }
                     cmd.current_dir(&repo).args(args);
                     match cmd.status() {
                         Ok(s) => {
-                            if s.success() { log("Repair: installation finished"); } else { log(&format!("Repair: pip exited with status {}", s)); }
+                            if s.success() {
+                                log("Repair: installation finished");
+                            } else {
+                                log(&format!("Repair: pip exited with status {}", s));
+                            }
                         }
                         Err(e) => log(&format!("Repair: failed to spawn pip: {}", e)),
                     }

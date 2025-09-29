@@ -27,4 +27,6 @@ mod macos;
 pub use macos::create_host as create_platform_host;
 
 #[cfg(not(all(target_os = "macos", feature = "embed-webview")))]
-pub fn create_platform_host() -> Option<Box<dyn WebViewHost>> { None }
+pub fn create_platform_host() -> Option<Box<dyn WebViewHost>> {
+    None
+}

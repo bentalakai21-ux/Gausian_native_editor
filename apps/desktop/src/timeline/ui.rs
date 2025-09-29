@@ -2,13 +2,13 @@ use std::path::Path;
 
 use crate::timeline_crate::{
     ClipNode, Fps, FrameRange, ItemKind, NodeId, TimelineCommand, TimelineNode, TimelineNodeKind,
-    TrackKind, TrackPlacement,
+    TrackId, TrackKind, TrackPlacement,
 };
 use eframe::egui::{self, Color32, Rect, Shape, Stroke};
 use serde_json::Value;
 
 use crate::decode::PlayState;
-use crate::interaction::{DragMode, DragState};
+use crate::interaction::{DragMode, DragState, LinkedDragNode};
 use crate::App;
 
 #[derive(Debug, Clone)]
@@ -43,6 +43,53 @@ pub(crate) fn frames_to_seconds(frames: i64, fps: Fps) -> f64 {
 }
 
 impl App {
+    fn gather_linked_drag_nodes(
+        &self,
+        primary_id: NodeId,
+        primary_clip: &ClipNode,
+    ) -> Vec<LinkedDragNode> {
+        let asset_id = primary_clip.asset_id.clone();
+        let orig_from = primary_clip.timeline_range.start;
+        let orig_dur = primary_clip.timeline_range.duration;
+        let orig_media_start = primary_clip.media_range.start;
+
+        let mut linked = Vec::new();
+        if asset_id.is_none() {
+            return linked;
+        }
+
+        for (ti, binding) in self.seq.graph.tracks.iter().enumerate() {
+            for (idx, node_id) in binding.node_ids.iter().enumerate() {
+                if *node_id == primary_id {
+                    continue;
+                }
+                if let Some(node) = self.seq.graph.nodes.get(node_id) {
+                    if let TimelineNodeKind::Clip(clip) = &node.kind {
+                        if clip.asset_id == asset_id
+                            && clip.timeline_range.start == orig_from
+                            && clip.timeline_range.duration == orig_dur
+                            && clip.media_range.start == orig_media_start
+                        {
+                            linked.push(LinkedDragNode {
+                                node_id: *node_id,
+                                original_node: node.clone(),
+                                original_track_id: binding.id,
+                                original_track_index: ti,
+                                current_track_index: ti,
+                                original_position: idx,
+                                orig_from: clip.timeline_range.start,
+                                orig_dur: clip.timeline_range.duration,
+                                orig_media_start: clip.media_range.start,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+
+        linked
+    }
+
     pub(crate) fn display_info_for_node(
         node: &TimelineNode,
         track_kind: &TrackKind,
@@ -122,6 +169,22 @@ impl App {
         if target_track >= self.seq.graph.tracks.len() || drag.current_track_index == target_track {
             return;
         }
+
+        let original_kind = self
+            .seq
+            .graph
+            .tracks
+            .get(drag.original_track_index)
+            .map(|t| t.kind.clone());
+        let target_kind = self.seq.graph.tracks.get(target_track).map(|t| t.kind.clone());
+        if let (Some(orig), Some(target)) = (original_kind, target_kind) {
+            let orig_is_audio = matches!(orig, TrackKind::Audio);
+            let target_is_audio = matches!(target, TrackKind::Audio);
+            if orig_is_audio != target_is_audio {
+                return;
+            }
+        }
+
         if let Some(binding) = self.seq.graph.tracks.get_mut(drag.current_track_index) {
             if let Some(pos) = binding.node_ids.iter().position(|id| *id == drag.node_id) {
                 binding.node_ids.remove(pos);
@@ -133,9 +196,15 @@ impl App {
         drag.current_track_index = target_track;
     }
 
-    pub(crate) fn restore_drag_preview(&mut self, drag: &DragState) {
+    fn restore_single_drag_node(
+        &mut self,
+        node_id: NodeId,
+        original_node: &TimelineNode,
+        original_track_id: TrackId,
+        original_position: usize,
+    ) {
         for binding in &mut self.seq.graph.tracks {
-            if let Some(pos) = binding.node_ids.iter().position(|id| *id == drag.node_id) {
+            if let Some(pos) = binding.node_ids.iter().position(|id| *id == node_id) {
                 binding.node_ids.remove(pos);
             }
         }
@@ -144,18 +213,33 @@ impl App {
             .graph
             .tracks
             .iter_mut()
-            .find(|b| b.id == drag.original_track_id)
+            .find(|b| b.id == original_track_id)
         {
-            let pos = drag.original_position.min(binding.node_ids.len());
-            binding.node_ids.insert(pos, drag.node_id);
+            let pos = original_position.min(binding.node_ids.len());
+            binding.node_ids.insert(pos, node_id);
         }
-        self.seq
-            .graph
-            .nodes
-            .insert(drag.node_id, drag.original_node.clone());
+        self.seq.graph.nodes.insert(node_id, original_node.clone());
+    }
+
+    pub(crate) fn restore_drag_preview(&mut self, drag: &DragState) {
+        self.restore_single_drag_node(
+            drag.node_id,
+            &drag.original_node,
+            drag.original_track_id,
+            drag.original_position,
+        );
+        for linked in &drag.linked {
+            self.restore_single_drag_node(
+                linked.node_id,
+                &linked.original_node,
+                linked.original_track_id,
+                linked.original_position,
+            );
+        }
     }
 
     pub(crate) fn preview_move_node(&mut self, drag: &DragState, new_from: i64) {
+        let delta = new_from - drag.orig_from;
         if let Some(node) = self.seq.graph.nodes.get_mut(&drag.node_id) {
             match &mut node.kind {
                 TimelineNodeKind::Clip(clip) => {
@@ -167,6 +251,25 @@ impl App {
                     timeline_range.duration = drag.orig_dur;
                 }
                 _ => {}
+            }
+        }
+
+        for linked in &drag.linked {
+            let target_start = (linked.orig_from + delta).max(0);
+            if let Some(node) = self.seq.graph.nodes.get_mut(&linked.node_id) {
+                match &mut node.kind {
+                    TimelineNodeKind::Clip(clip) => {
+                        clip.timeline_range.start = target_start;
+                        clip.timeline_range.duration = linked.orig_dur;
+                        clip.media_range.start = linked.orig_media_start;
+                        clip.media_range.duration = linked.orig_dur;
+                    }
+                    TimelineNodeKind::Generator { timeline_range, .. } => {
+                        timeline_range.start = target_start;
+                        timeline_range.duration = linked.orig_dur;
+                    }
+                    _ => {}
+                }
             }
         }
     }
@@ -197,6 +300,22 @@ impl App {
                 _ => {}
             }
         }
+
+        for linked in &drag.linked {
+            let target_start = (linked.orig_from + delta_frames).max(0);
+            let target_duration = (linked.orig_dur - delta_frames).max(1);
+            if let Some(node) = self.seq.graph.nodes.get_mut(&linked.node_id) {
+                if let (TimelineNodeKind::Clip(clip), TimelineNodeKind::Clip(orig_clip)) =
+                    (&mut node.kind, &linked.original_node.kind)
+                {
+                    let media_start = orig_clip.media_range.start + delta_frames;
+                    clip.timeline_range.start = target_start;
+                    clip.timeline_range.duration = target_duration;
+                    clip.media_range.start = media_start;
+                    clip.media_range.duration = target_duration;
+                }
+            }
+        }
     }
 
     pub(crate) fn preview_trim_end_node(&mut self, drag: &DragState, new_duration: i64) {
@@ -210,6 +329,22 @@ impl App {
                     timeline_range.duration = new_duration;
                 }
                 _ => {}
+            }
+        }
+
+        for linked in &drag.linked {
+            if let Some(node) = self.seq.graph.nodes.get_mut(&linked.node_id) {
+                match &mut node.kind {
+                    TimelineNodeKind::Clip(clip) => {
+                        let clamped = new_duration.max(1);
+                        clip.timeline_range.duration = clamped;
+                        clip.media_range.duration = clamped;
+                    }
+                    TimelineNodeKind::Generator { timeline_range, .. } => {
+                        timeline_range.duration = new_duration.max(1);
+                    }
+                    _ => {}
+                }
             }
         }
     }
@@ -275,6 +410,15 @@ impl App {
             .get(drag.current_track_index)
             .map(|b| b.id);
         let final_node = self.seq.graph.nodes.get(&drag.node_id).cloned();
+        let linked_finals: Vec<(LinkedDragNode, Option<TimelineNode>)> = drag
+            .linked
+            .iter()
+            .cloned()
+            .map(|ln| {
+                let node = self.seq.graph.nodes.get(&ln.node_id).cloned();
+                (ln, node)
+            })
+            .collect();
         self.restore_drag_preview(&drag);
 
         if let Some(node) = final_node {
@@ -315,6 +459,18 @@ impl App {
         } else {
             self.sync_tracks_from_graph();
         }
+
+        for (linked, final_node) in linked_finals {
+            if let Some(node) = final_node {
+                if node == linked.original_node {
+                    continue;
+                }
+                if let Err(err) = self.apply_timeline_command(TimelineCommand::UpdateNode { node })
+                {
+                    eprintln!("timeline update failed: {err}");
+                }
+            }
+        }
     }
 
     pub(crate) fn split_clip_at_frame(&mut self, track: usize, item: usize, split_frame: i64) {
@@ -333,52 +489,76 @@ impl App {
 
         match node.kind {
             TimelineNodeKind::Clip(ref clip) => {
-                let start = clip.timeline_range.start;
-                let end = clip.timeline_range.end();
-                if split_frame <= start || split_frame >= end {
-                    return;
+                let mut targets: Vec<(usize, TrackId, usize, NodeId, TimelineNode)> = Vec::new();
+                targets.push((track, track_binding.id, item, node_id, node.clone()));
+                for ln in self.gather_linked_drag_nodes(node_id, clip) {
+                    targets.push((
+                        ln.original_track_index,
+                        ln.original_track_id,
+                        ln.original_position,
+                        ln.node_id,
+                        ln.original_node.clone(),
+                    ));
                 }
-                let left_dur = split_frame - start;
-                let right_dur = end - split_frame;
 
-                let mut left_clip = clip.clone();
-                left_clip.timeline_range = FrameRange::new(start, left_dur);
-                left_clip.media_range = FrameRange::new(clip.media_range.start, left_dur);
-
-                let mut updated_node = node.clone();
-                updated_node.kind = TimelineNodeKind::Clip(left_clip);
-                if let Err(err) =
-                    self.apply_timeline_command(TimelineCommand::UpdateNode { node: updated_node })
+                for (target_track, target_track_id, target_pos, target_node_id, target_node) in
+                    targets
                 {
-                    eprintln!("timeline update failed: {err}");
-                    return;
-                }
+                    if let TimelineNodeKind::Clip(ref clip) = target_node.kind {
+                        let start = clip.timeline_range.start;
+                        let end = clip.timeline_range.end();
+                        if split_frame <= start || split_frame >= end {
+                            continue;
+                        }
+                        let left_dur = split_frame - start;
+                        let right_dur = end - split_frame;
 
-                let right_media_start = clip.media_range.start + left_dur;
-                let mut right_clip = clip.clone();
-                right_clip.timeline_range = FrameRange::new(split_frame, right_dur);
-                right_clip.media_range = FrameRange::new(right_media_start, right_dur);
+                        let mut left_clip = clip.clone();
+                        left_clip.timeline_range = FrameRange::new(start, left_dur);
+                        left_clip.media_range = FrameRange::new(clip.media_range.start, left_dur);
 
-                let right_node = TimelineNode {
-                    id: NodeId::new(),
-                    label: node.label.clone(),
-                    kind: TimelineNodeKind::Clip(right_clip),
-                    locked: node.locked,
-                    metadata: node.metadata.clone(),
-                };
-                let placement = TrackPlacement {
-                    track_id: track_binding.id,
-                    position: Some(item + 1),
-                };
-                if let Err(err) = self.apply_timeline_command(TimelineCommand::InsertNode {
-                    node: right_node,
-                    placements: vec![placement],
-                    edges: Vec::new(),
-                }) {
-                    eprintln!("timeline insert failed: {err}");
-                    return;
+                        let mut updated_node = target_node.clone();
+                        updated_node.kind = TimelineNodeKind::Clip(left_clip);
+                        if let Err(err) = self.apply_timeline_command(TimelineCommand::UpdateNode {
+                            node: updated_node,
+                        }) {
+                            eprintln!("timeline update failed: {err}");
+                            continue;
+                        }
+
+                        let right_media_start = clip.media_range.start + left_dur;
+                        let mut right_clip = clip.clone();
+                        right_clip.timeline_range = FrameRange::new(split_frame, right_dur);
+                        right_clip.media_range = FrameRange::new(right_media_start, right_dur);
+
+                        let right_node = TimelineNode {
+                            id: NodeId::new(),
+                            label: target_node.label.clone(),
+                            kind: TimelineNodeKind::Clip(right_clip),
+                            locked: target_node.locked,
+                            metadata: target_node.metadata.clone(),
+                        };
+                        let placement = TrackPlacement {
+                            track_id: target_track_id,
+                            position: Some(target_pos + 1),
+                        };
+                        if let Err(err) = self.apply_timeline_command(TimelineCommand::InsertNode {
+                            node: right_node,
+                            placements: vec![placement],
+                            edges: Vec::new(),
+                        }) {
+                            eprintln!("timeline insert failed: {err}");
+                            continue;
+                        }
+
+                        if target_node_id == node_id {
+                            self.selected = Some((target_track, target_pos + 1));
+                        }
+                    }
                 }
-                self.selected = Some((track, item + 1));
+                if self.selected.is_none() {
+                    self.selected = Some((track, item + 1));
+                }
             }
             TimelineNodeKind::Generator {
                 ref generator_id,
@@ -473,10 +653,12 @@ impl App {
             .drag_to_scroll(false)
             .show(ui, |ui| {
                 let mut to_request: Vec<std::path::PathBuf> = Vec::new();
+                let mut clicked_item = false;
                 let (rect, response) = ui.allocate_exact_size(
                     egui::vec2(content_w, content_h),
                     egui::Sense::click_and_drag(),
                 );
+                self.timeline_drop_rect = Some(rect);
                 let painter = ui.painter_at(rect);
                 // Background
                 painter.rect_filled(rect, 0.0, egui::Color32::from_rgb(18, 18, 20));
@@ -484,13 +666,28 @@ impl App {
                 if let Some(asset) = self.dragging_asset.as_ref() {
                     if let Some(pos) = ui.input(|i| i.pointer.hover_pos()) {
                         if rect.contains(pos) {
-                            let track_idx = ((pos.y - rect.top()) / track_h).floor().max(0.0) as usize;
+                            let track_idx =
+                                ((pos.y - rect.top()) / track_h).floor().max(0.0) as usize;
                             let y0 = rect.top() + track_idx as f32 * track_h;
                             let start_frames = ((pos.x - rect.left()).max(0.0) as f64
                                 / self.zoom_px_per_frame as f64)
-                                .round()
-                                as i64;
-                            let dur = asset.duration_frames.unwrap_or(150).max(1);
+                                .round() as i64;
+                            let seq_fps = self.seq.fps;
+                            let seq_rate = {
+                                let num = seq_fps.num.max(1) as f64;
+                                let den = seq_fps.den.max(1) as f64;
+                                if den > 0.0 {
+                                    num / den
+                                } else {
+                                    30.0
+                                }
+                            };
+                            let dur = asset
+                                .duration_seconds()
+                                .map(|sec| (sec * seq_rate).round() as i64)
+                                .filter(|v| *v > 0)
+                                .or_else(|| asset.duration_frames.map(|v| v.max(1)))
+                                .unwrap_or(150);
                             let x0 = rect.left() + start_frames as f32 * self.zoom_px_per_frame;
                             let x1 = x0 + (dur as f32 * self.zoom_px_per_frame).max(12.0);
                             let r = egui::Rect::from_min_max(
@@ -551,7 +748,9 @@ impl App {
                     // Subtle shaded background per track kind
                     let row_color = match &binding.kind {
                         TrackKind::Audio => egui::Color32::from_rgba_unmultiplied(30, 50, 30, 40),
-                        TrackKind::Automation => egui::Color32::from_rgba_unmultiplied(50, 40, 20, 30),
+                        TrackKind::Automation => {
+                            egui::Color32::from_rgba_unmultiplied(50, 40, 20, 30)
+                        }
                         TrackKind::Custom(id) if id == "image" => {
                             egui::Color32::from_rgba_unmultiplied(35, 40, 55, 40)
                         }
@@ -682,6 +881,7 @@ impl App {
                         );
                         if resp.clicked() {
                             self.selected = Some((ti, ii));
+                            clicked_item = true;
                         }
                         if resp.drag_started() {
                             if let Some(binding) = self.seq.graph.tracks.get(ti) {
@@ -700,6 +900,13 @@ impl App {
                                         };
                                         let range = Self::node_frame_range(node)
                                             .unwrap_or(FrameRange::new(0, 0));
+                                        let (asset_id, linked) = match &node.kind {
+                                            TimelineNodeKind::Clip(clip) => (
+                                                clip.asset_id.clone(),
+                                                self.gather_linked_drag_nodes(*node_id, clip),
+                                            ),
+                                            _ => (None, Vec::new()),
+                                        };
                                         self.selected = Some((ti, ii));
                                         self.drag = Some(DragState {
                                             original_track_index: ti,
@@ -712,6 +919,8 @@ impl App {
                                             original_node: node.clone(),
                                             original_track_id: binding.id,
                                             original_position: ii,
+                                            asset_id,
+                                            linked,
                                         });
                                     }
                                 }
@@ -732,7 +941,12 @@ impl App {
                 );
 
                 // Click/drag background to scrub (when not dragging a clip)
+                if response.clicked() && !clicked_item {
+                    self.selected = None;
+                }
+
                 if self.drag.is_none() && self.dragging_asset.is_none() {
+                    let was_playing = self.playback_clock.playing;
                     // Single click: move playhead on mouse up as well
                     if response.clicked() {
                         if let Some(pos) = response.interact_pointer_pos() {
@@ -746,7 +960,13 @@ impl App {
                             if let Some(engine) = &self.audio_out {
                                 engine.seek(sec);
                             }
-                            self.engine.state = PlayState::Seeking;
+                            if was_playing {
+                                self.engine.state = PlayState::Playing;
+                                self.last_sent = None;
+                                self.last_seek_sent_pts = None;
+                            } else {
+                                self.engine.state = PlayState::Seeking;
+                            }
                         }
                     }
                     // Drag: continuously update while primary is down
@@ -759,7 +979,13 @@ impl App {
                             let sec = (frames as f64) / fps;
                             self.playback_clock.seek_to(sec);
                             self.playhead = frames.clamp(0, self.seq.duration_in_frames);
-                            self.engine.state = PlayState::Scrubbing;
+                            if was_playing {
+                                self.engine.state = PlayState::Playing;
+                                self.last_sent = None;
+                                self.last_seek_sent_pts = None;
+                            } else {
+                                self.engine.state = PlayState::Scrubbing;
+                            }
                             if let Some(engine) = &self.audio_out {
                                 engine.seek(sec);
                             }
@@ -799,9 +1025,13 @@ impl App {
                         if let Some(pos) = ui.input(|i| i.pointer.hover_pos()) {
                             if rect.contains(pos) {
                                 let local_x = (pos.x - rect.left()).max(0.0) as f64;
-                                let frames = (local_x / self.zoom_px_per_frame as f64).round() as i64;
+                                let frames =
+                                    (local_x / self.zoom_px_per_frame as f64).round() as i64;
                                 let track_idx = ((pos.y - rect.top()) / track_h).floor() as isize;
-                                let track_idx = track_idx.clamp(0, (self.seq.graph.tracks.len().saturating_sub(1)) as isize) as usize;
+                                let track_idx = track_idx.clamp(
+                                    0,
+                                    (self.seq.graph.tracks.len().saturating_sub(1)) as isize,
+                                ) as usize;
                                 self.insert_asset_at(&asset, track_idx, frames);
                             }
                         }

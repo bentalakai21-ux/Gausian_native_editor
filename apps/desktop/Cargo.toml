@@ -31,11 +31,17 @@ native-decoder = { path = "../../crates/native-decoder", features = ["gstreamer"
 tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
 tracing = "0.1"
 symphonia = { version = "0.5", features = ["aac", "flac", "vorbis", "mp3", "wav"] }
+gstreamer = "0.22"
+gstreamer-app = "0.22"
+gstreamer-audio = "0.22"
 webbrowser = "0.8"
 walkdir = "2"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 ureq = { version = "2" }
-tungstenite = { version = "0.21", default-features = true }
+# Enable TLS for wss:// connections to Modal
+# rustls with system roots keeps build portable without OpenSSL
+# Enable client handshake + TLS + Url support for wss:// connections
+tungstenite = { version = "0.21", default-features = false, features = ["handshake", "url", "rustls-tls-native-roots"] }
 url = "2"
 urlencoding = "2"
 http = "1"

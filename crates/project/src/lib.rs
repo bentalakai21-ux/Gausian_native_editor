@@ -129,7 +129,9 @@ impl ProjectDb {
     }
 
     pub fn get_project_base_path(&self, id: &str) -> Result<Option<PathBuf>> {
-        let mut stmt = self.conn.prepare("SELECT base_path FROM projects WHERE id = ?1 LIMIT 1")?;
+        let mut stmt = self
+            .conn
+            .prepare("SELECT base_path FROM projects WHERE id = ?1 LIMIT 1")?;
         let mut rows = stmt.query(params![id])?;
         if let Some(row) = rows.next()? {
             let bp: Option<String> = row.get(0)?;
@@ -212,7 +214,7 @@ impl ProjectDb {
 
     pub fn list_assets(&self, project_id: &str) -> Result<Vec<AssetRow>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, project_id, kind, src_abs, width, height, duration_frames, fps_num, fps_den \
+            "SELECT id, project_id, kind, src_abs, width, height, duration_frames, fps_num, fps_den, audio_channels, sample_rate \
              FROM assets WHERE project_id = ?1 ORDER BY created_at DESC LIMIT 1000",
         )?;
         let rows = stmt.query_map(params![project_id], |row| {
@@ -226,6 +228,8 @@ impl ProjectDb {
                 duration_frames: row.get(6)?,
                 fps_num: row.get(7)?,
                 fps_den: row.get(8)?,
+                audio_channels: row.get(9)?,
+                sample_rate: row.get(10)?,
             })
         })?;
         let mut out = Vec::new();
@@ -236,9 +240,9 @@ impl ProjectDb {
     }
 
     pub fn list_projects(&self) -> Result<Vec<ProjectInfo>> {
-        let mut stmt = self
-            .conn
-            .prepare("SELECT id, name, base_path FROM projects ORDER BY updated_at DESC, created_at DESC")?;
+        let mut stmt = self.conn.prepare(
+            "SELECT id, name, base_path FROM projects ORDER BY updated_at DESC, created_at DESC",
+        )?;
         let rows = stmt.query_map([], |row| {
             Ok(ProjectInfo {
                 id: row.get(0)?,
@@ -247,8 +251,35 @@ impl ProjectDb {
             })
         })?;
         let mut out = Vec::new();
-        for r in rows { out.push(r?); }
+        for r in rows {
+            out.push(r?);
+        }
         Ok(out)
+    }
+
+    pub fn find_asset_by_path(&self, project_id: &str, src_abs: &str) -> Result<Option<AssetRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, project_id, kind, src_abs, width, height, duration_frames, fps_num, fps_den, audio_channels, sample_rate \
+             FROM assets WHERE project_id = ?1 AND src_abs = ?2 LIMIT 1",
+        )?;
+        let mut rows = stmt.query(params![project_id, src_abs])?;
+        if let Some(row) = rows.next()? {
+            Ok(Some(AssetRow {
+                id: row.get(0)?,
+                project_id: row.get(1)?,
+                kind: row.get(2)?,
+                src_abs: row.get(3)?,
+                width: row.get(4)?,
+                height: row.get(5)?,
+                duration_frames: row.get(6)?,
+                fps_num: row.get(7)?,
+                fps_den: row.get(8)?,
+                audio_channels: row.get(9)?,
+                sample_rate: row.get(10)?,
+            }))
+        } else {
+            Ok(None)
+        }
     }
 }
 
@@ -263,6 +294,27 @@ pub struct AssetRow {
     pub duration_frames: Option<i64>,
     pub fps_num: Option<i64>,
     pub fps_den: Option<i64>,
+    pub audio_channels: Option<i64>,
+    pub sample_rate: Option<i64>,
+}
+
+impl AssetRow {
+    pub fn duration_seconds(&self) -> Option<f64> {
+        let frames = self.duration_frames?;
+        let fps_num = self.fps_num?;
+        let fps_den = self.fps_den?;
+        if frames <= 0 || fps_num <= 0 || fps_den <= 0 {
+            return None;
+        }
+        let frames = frames as f64;
+        let fps_num = fps_num as f64;
+        let fps_den = fps_den as f64;
+        Some(frames * (fps_den / fps_num))
+    }
+
+    pub fn has_audio(&self) -> bool {
+        self.audio_channels.unwrap_or(0) > 0
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -283,7 +335,7 @@ pub struct JobRow {
 impl ProjectDb {
     pub fn get_asset(&self, asset_id: &str) -> Result<AssetRow> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, project_id, kind, src_abs, width, height, duration_frames, fps_num, fps_den \
+            "SELECT id, project_id, kind, src_abs, width, height, duration_frames, fps_num, fps_den, audio_channels, sample_rate \
              FROM assets WHERE id = ?1 LIMIT 1",
         )?;
         let mut rows = stmt.query(params![asset_id])?;
@@ -298,6 +350,8 @@ impl ProjectDb {
                 duration_frames: row.get(6)?,
                 fps_num: row.get(7)?,
                 fps_den: row.get(8)?,
+                audio_channels: row.get(9)?,
+                sample_rate: row.get(10)?,
             })
         } else {
             Err(anyhow::anyhow!("asset not found"))

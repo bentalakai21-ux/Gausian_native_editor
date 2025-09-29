@@ -51,6 +51,7 @@ impl ExportUiState {
     pub(crate) fn ui(
         &mut self,
         ctx: &egui::Context,
+        frame: &eframe::Frame,
         seq: &Sequence,
         db: &ProjectDb,
         project_id: &str,
@@ -88,10 +89,10 @@ impl ExportUiState {
                                 ExportCodec::H264 => "export.mp4",
                                 ExportCodec::AV1 => "export.mkv",
                             };
-                            if let Some(path) = rfd::FileDialog::new()
-                                .set_file_name(default_name)
-                                .save_file()
-                            {
+                            let dialog = rfd::FileDialog::new()
+                                .set_parent(frame)
+                                .set_file_name(default_name);
+                            if let Some(path) = dialog.save_file() {
                                 self.output_path = path.display().to_string();
                             }
                         }

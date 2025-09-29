@@ -30,11 +30,11 @@ use decode::{
 use interaction::{DragMode, DragState};
 mod audio_decode;
 mod audio_engine;
+mod comfyui;
+mod embed_webview;
 mod export;
 mod jobs;
 mod preview;
-mod comfyui;
-mod embed_webview;
 use audio_decode::decode_audio_to_buffer;
 use audio_engine::{ActiveAudioClip, AudioBuffer, AudioEngine};
 pub use export::{ExportCodec, ExportPreset, ExportProgress, ExportUiState};
@@ -48,8 +48,8 @@ use preview::PreviewState;
 use std::collections::HashMap;
 // use std::collections::VecDeque;
 // use std::hash::Hash;
-use walkdir::WalkDir;
 use crossbeam_channel::{unbounded, Receiver, Sender};
+use walkdir::WalkDir;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CloudUpdateSrc {
     Ws,
@@ -64,9 +64,21 @@ enum ModalEvent {
     JobQueuedWithPrefix(String, String),
     // (job_id, [(filename, url)])
     Recent(Vec<(String, Vec<(String, String)>)>),
-    CloudStatus { pending: usize, running: usize },
-    CloudProgress { job_id: String, progress: f32, current: u32, total: u32, node_id: Option<String> },
-    CloudSource { job_id: String, source: CloudUpdateSrc },
+    CloudStatus {
+        pending: usize,
+        running: usize,
+    },
+    CloudProgress {
+        job_id: String,
+        progress: f32,
+        current: u32,
+        total: u32,
+        node_id: Option<String>,
+    },
+    CloudSource {
+        job_id: String,
+        source: CloudUpdateSrc,
+    },
     JobImporting(String),
     JobImported(String),
 }
@@ -91,7 +103,10 @@ fn main() {
     let db_path = data_dir.join("app.db");
     let db = ProjectDb::open_or_create(&db_path).expect("open db");
 
-    let options = NativeOptions::default();
+    let options = NativeOptions {
+        viewport: egui::ViewportBuilder::default().with_fullscreen(true),
+        ..NativeOptions::default()
+    };
     let _ = eframe::run_native(
         "Gausian Native Editor",
         options,
@@ -108,12 +123,17 @@ fn nearest_common_ancestor(paths: &[PathBuf]) -> Option<PathBuf> {
         match std::fs::metadata(p) {
             Ok(md) => {
                 if md.is_file() {
-                    p.parent().map(|pp| pp.to_path_buf()).unwrap_or_else(|| p.clone())
+                    p.parent()
+                        .map(|pp| pp.to_path_buf())
+                        .unwrap_or_else(|| p.clone())
                 } else {
                     p.clone()
                 }
             }
-            Err(_) => p.parent().map(|pp| pp.to_path_buf()).unwrap_or_else(|| p.clone()),
+            Err(_) => p
+                .parent()
+                .map(|pp| pp.to_path_buf())
+                .unwrap_or_else(|| p.clone()),
         }
     };
     let mut it = paths.iter();

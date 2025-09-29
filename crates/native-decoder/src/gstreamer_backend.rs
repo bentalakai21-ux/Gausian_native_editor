@@ -17,9 +17,9 @@ use tracing::{debug, warn};
 use gstreamer as gst;
 use gstreamer::prelude::*;
 use gstreamer_app as gst_app;
+use gstreamer_pbutils as gst_pbutils;
 use gstreamer_video as gst_video;
 use gstreamer_video::VideoFrameExt; // plane_stride/plane_data access
-use gstreamer_pbutils as gst_pbutils;
 
 // Initialize GStreamer once per process.
 static GST_INIT_ONCE: AtomicBool = AtomicBool::new(false);
@@ -95,8 +95,12 @@ fn build_pipeline(path: &Path) -> Result<(gst::Pipeline, gst_app::AppSink)> {
     // Link decodebin's newly created video pad to videoconvert.
     let convert_weak = convert.downgrade();
     decodebin.connect_pad_added(move |_dbin, src_pad| {
-        let Some(convert) = convert_weak.upgrade() else { return; };
-        let Some(sink_pad) = convert.static_pad("sink") else { return; };
+        let Some(convert) = convert_weak.upgrade() else {
+            return;
+        };
+        let Some(sink_pad) = convert.static_pad("sink") else {
+            return;
+        };
         if sink_pad.is_linked() {
             return;
         }
@@ -215,18 +219,26 @@ impl GstDecoder {
         if self.strict_paused {
             // Give the pipeline time (adaptive) to complete accurate seek + preroll
             let wait_ms = self.strict_wait_budget_ms();
-            let deadline = std::time::Instant::now()
-                + std::time::Duration::from_millis(wait_ms);
+            let deadline = std::time::Instant::now() + std::time::Duration::from_millis(wait_ms);
             while std::time::Instant::now() < deadline {
                 if let Some(msg) = self.bus.timed_pop_filtered(
                     gst::ClockTime::from_mseconds(33),
-                    &[gst::MessageType::AsyncDone, gst::MessageType::Error, gst::MessageType::Eos],
+                    &[
+                        gst::MessageType::AsyncDone,
+                        gst::MessageType::Error,
+                        gst::MessageType::Eos,
+                    ],
                 ) {
                     use gst::MessageView;
                     match msg.view() {
                         MessageView::AsyncDone(_) => break,
                         MessageView::Error(e) => {
-                            debug!("GStreamer seek error from {}: {} ({:?})", e.src().map(|s| s.path_string()).unwrap_or_default(), e.error(), e.debug());
+                            debug!(
+                                "GStreamer seek error from {}: {} ({:?})",
+                                e.src().map(|s| s.path_string()).unwrap_or_default(),
+                                e.error(),
+                                e.debug()
+                            );
                             break;
                         }
                         MessageView::Eos(_) => break,
@@ -249,7 +261,12 @@ impl GstDecoder {
                     debug!("GStreamer: EOS");
                 }
                 MessageView::Error(e) => {
-                    warn!("GStreamer error from {}: {} ({:?})", e.src().map(|s| s.path_string()).unwrap_or_default(), e.error(), e.debug());
+                    warn!(
+                        "GStreamer error from {}: {} ({:?})",
+                        e.src().map(|s| s.path_string()).unwrap_or_default(),
+                        e.error(),
+                        e.debug()
+                    );
                 }
                 _ => {}
             }
@@ -314,10 +331,9 @@ impl GstDecoder {
                 // Prefer mapping via gst_video to handle stride/padding.
                 if let Some(caps) = sample.caps() {
                     if let Ok(info) = gst_video::VideoInfo::from_caps(&caps) {
-                        if let Ok(vf) = gst_video::VideoFrameRef::from_buffer_ref_readable(
-                            &buffer,
-                            &info,
-                        ) {
+                        if let Ok(vf) =
+                            gst_video::VideoFrameRef::from_buffer_ref_readable(&buffer, &info)
+                        {
                             // Plane 0: Y, Plane 1: interleaved UV
                             let (w0, h0) = (info.width() as usize, info.height() as usize);
                             let y_sz = w0 * h0;
@@ -363,7 +379,9 @@ impl GstDecoder {
                                 height: info.height(),
                                 timestamp: pts,
                             });
-                            if self.strict_paused { break; }
+                            if self.strict_paused {
+                                break;
+                            }
                             continue; // next sample
                         }
                     }
@@ -392,7 +410,9 @@ impl GstDecoder {
                             height: h,
                             timestamp: pts,
                         });
-                        if self.strict_paused { break; }
+                        if self.strict_paused {
+                            break;
+                        }
                         continue;
                     }
                 }
@@ -438,7 +458,9 @@ impl NativeVideoDecoder for GstDecoder {
         };
         if need_seek && !self.strict_paused {
             self.seek_to_internal(timestamp)?;
-            if let Ok(mut last) = self.last_seek.lock() { *last = timestamp; }
+            if let Ok(mut last) = self.last_seek.lock() {
+                *last = timestamp;
+            }
             self.ring.clear();
         }
         // Drain bus and pull a few samples into the ring
@@ -447,7 +469,9 @@ impl NativeVideoDecoder for GstDecoder {
         // Choose nearest at or before target
         let out = self.ring.pop_nearest_at_or_before(timestamp);
         if let Some(ref f) = out {
-            if let Ok(mut last_out) = self.last_out_pts.lock() { *last_out = f.timestamp; }
+            if let Ok(mut last_out) = self.last_out_pts.lock() {
+                *last_out = f.timestamp;
+            }
         }
         Ok(out)
     }
@@ -512,22 +536,32 @@ impl NativeVideoDecoder for GstDecoder {
         self.pipeline
             .seek_simple(gst::SeekFlags::FLUSH | gst::SeekFlags::KEY_UNIT, t)
             .map_err(|_| anyhow!("pipeline key-unit seek failed"))?;
-        if let Ok(mut last) = self.last_seek.lock() { *last = timestamp; }
+        if let Ok(mut last) = self.last_seek.lock() {
+            *last = timestamp;
+        }
         // Wait for ASYNC_DONE like accurate seek to ensure preroll readiness (adaptive)
         if self.strict_paused {
             let wait_ms = self.strict_wait_budget_ms();
-            let deadline = std::time::Instant::now()
-                + std::time::Duration::from_millis(wait_ms);
+            let deadline = std::time::Instant::now() + std::time::Duration::from_millis(wait_ms);
             while std::time::Instant::now() < deadline {
                 if let Some(msg) = self.bus.timed_pop_filtered(
                     gst::ClockTime::from_mseconds(33),
-                    &[gst::MessageType::AsyncDone, gst::MessageType::Error, gst::MessageType::Eos],
+                    &[
+                        gst::MessageType::AsyncDone,
+                        gst::MessageType::Error,
+                        gst::MessageType::Eos,
+                    ],
                 ) {
                     use gst::MessageView;
                     match msg.view() {
                         MessageView::AsyncDone(_) => break,
                         MessageView::Error(e) => {
-                            debug!("GStreamer key-unit seek error from {}: {} ({:?})", e.src().map(|s| s.path_string()).unwrap_or_default(), e.error(), e.debug());
+                            debug!(
+                                "GStreamer key-unit seek error from {}: {} ({:?})",
+                                e.src().map(|s| s.path_string()).unwrap_or_default(),
+                                e.error(),
+                                e.debug()
+                            );
                             break;
                         }
                         MessageView::Eos(_) => break,
@@ -541,7 +575,10 @@ impl NativeVideoDecoder for GstDecoder {
 }
 
 /// Public constructor used by lib::create_decoder when the feature is enabled.
-pub fn create_gst_decoder<P: AsRef<Path>>(path: P, config: DecoderConfig) -> Result<Box<dyn NativeVideoDecoder>> {
+pub fn create_gst_decoder<P: AsRef<Path>>(
+    path: P,
+    config: DecoderConfig,
+) -> Result<Box<dyn NativeVideoDecoder>> {
     let dec = GstDecoder::new(path, config)?;
     Ok(Box::new(dec))
 }
@@ -561,15 +598,28 @@ struct FrameRing {
 }
 
 impl FrameRing {
-    fn new(cap: usize) -> Self { Self { frames: Vec::with_capacity(cap), cap } }
-    fn clear(&mut self) { self.frames.clear(); }
-    fn len(&self) -> usize { self.frames.len() }
+    fn new(cap: usize) -> Self {
+        Self {
+            frames: Vec::with_capacity(cap),
+            cap,
+        }
+    }
+    fn clear(&mut self) {
+        self.frames.clear();
+    }
+    fn len(&self) -> usize {
+        self.frames.len()
+    }
     fn push(&mut self, f: VideoFrame) {
-        if self.frames.len() >= self.cap { self.frames.remove(0); }
+        if self.frames.len() >= self.cap {
+            self.frames.remove(0);
+        }
         self.frames.push(f);
     }
     fn pop_nearest_at_or_before(&mut self, target: f64) -> Option<VideoFrame> {
-        if self.frames.is_empty() { return None; }
+        if self.frames.is_empty() {
+            return None;
+        }
         // Find candidate with pts <= target and maximum pts
         let mut best_idx: Option<usize> = None;
         let mut best_dt = f64::INFINITY;
@@ -577,7 +627,10 @@ impl FrameRing {
             let pts = f.timestamp;
             if pts.is_finite() && pts <= target {
                 let dt = target - pts;
-                if dt < best_dt { best_dt = dt; best_idx = Some(i); }
+                if dt < best_dt {
+                    best_dt = dt;
+                    best_idx = Some(i);
+                }
             }
         }
         if let Some(i) = best_idx {
