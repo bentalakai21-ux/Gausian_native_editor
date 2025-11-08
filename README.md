@@ -1,212 +1,210 @@
-# Gausian Native Editor
+<div align="center">
+  <img src="apps/desktop/resources/logo_whitebg.png" width="96" alt="Gausian logo">
+  <h1>Gausian Native Editor</h1>
+  <p><b>Fast, native video editor and preview tool</b> built in Rust with GPU rendering, timeline editing, and local ComfyUI integration.</p>
 
-A fast, native video editor and preview tool written in Rust with optional cloud rendering/encoding via Modal and ComfyUI.
+  <p>
+    <a href="#-getting-started"><b>Get Started</b></a> •
+    <a href="#-features"><b>Features</b></a> •
+    <a href="#-architecture"><b>Architecture</b></a> •
+    <a href="#-desktop-app"><b>Desktop</b></a> •
+    <a href="#-cli"><b>CLI</b></a> •
+    <a href="#-decoder--gstreamer-notes"><b>Decoders</b></a>
+  </p>
 
-This README captures purpose/scope, current architecture, exact stack versions, how to run, and recent decisions so the project state stays discoverable.
+  <p>
+    <a href="https://gausian.xyz" target="_blank" rel="noopener noreferrer"><b>Visit gausian.xyz ↗</b></a>
+    &nbsp;•&nbsp;
+    <a href="https://discord.gg/JfsKWDBXHT" target="_blank" rel="noopener noreferrer"><b>Join our Discord ↗</b></a>
+  </p>
 
-## Purpose / Scope
+  <p>
+    <img alt="Rust" src="https://img.shields.io/badge/Rust-stable-orange">
+    <img alt="UI" src="https://img.shields.io/badge/UI-egui%20%2B%20wgpu-8A2BE2">
+    <img alt="Decoders" src="https://img.shields.io/badge/Decode-VideoToolbox%2FGStreamer-2CA5E0">
+    <img alt="Platforms" src="https://img.shields.io/badge/Platforms-macOS%20%7C%20Windows%20%7C%20Linux-4CAF50">
+    <a href="https://discord.gg/JfsKWDBXHT" target="_blank" rel="noopener noreferrer">
+      <img alt="Discord" src="https://img.shields.io/badge/Discord-Join-5865F2?logo=discord&logoColor=white">
+    </a>
+    <a href="https://x.com/maeng313" target="_blank" rel="noopener noreferrer">
+      <img alt="Follow on X" src="https://img.shields.io/badge/X-@maeng313-272a2d?logo=x&logoColor=white">
+    </a>
+  </p>
+</div>
 
-- Native desktop editor (Rust/egui) with timeline, assets, and real‑time preview
-- Local media import (FFmpeg/ffprobe), auto‑import from ComfyUI outputs
-- Cloud workflow (optional): submit ComfyUI jobs and monitor completions; import finished artifacts automatically
-- Modal scaffold (optional): H100 generator (frames) + L4 encoder (NVENC)
+<hr/>
 
-## Architecture (brief)
+Gausian is a native editor focused on snappy preview, practical timeline tools, and smooth ingest/export. It supports hardware decoding (VideoToolbox on macOS, GStreamer pipelines cross‑platform), a WGPU preview pipeline, and integrates with a local ComfyUI for prompt‑based generation via an embedded WebView and auto‑import of outputs. A CLI is included for headless operations.
 
-- apps/desktop (Rust/egui):
-  - Assets panel, timeline, GPU preview, export
-  - Local ComfyUI integration (embed optional; default OFF)
-  - Auto‑import from ComfyUI output folder (videos + images; true move semantics)
-  - Cloud section: queue job to /prompt, live job monitors (ComfyUI WS and Cloud WS)
+## ✨ Features
 
-- crates/* (Rust):
-  - timeline: graph, tracks, clips, command history
-  - project: SQLite DB, assets table, project timeline JSON persistence
-  - media-io: FFmpeg probing/exports (requires ffprobe on PATH)
-  - exporters, renderer, jobs, plugin-host (as in source tree)
+- GPU-accelerated preview (WGPU) with YUV→RGB shaders and readback
+- Timeline editing, assets panel, project persistence (SQLite)
+- Local ingest: FFmpeg/ffprobe probing, image/video/audio
+- Exporters: FCPXML (1.9/1.10), FCP7 XML, EDL, JSON
+- Proxy generation via GStreamer (ProRes/NVENC/VAAPI/software)
+- Local ComfyUI: optional embedded WebView and auto‑import from a local ComfyUI output folder
+- Screenplay/Storyboard helpers with LLM providers (OpenAI, etc.)
+- Cross-platform desktop (macOS/Windows/Linux)
 
-- modal_app (Python; scaffold):
-  - generate_frames (H100): emit frames + manifest.json to S3
-  - encode_video (L4): NVENC encode frames → MP4; fallback to libx264
-  - /health endpoint for connectivity checks
+## 🚀 Getting Started
 
-## GStreamer decoder diagnostics (macOS)
+Prerequisites
+- Rust (stable)
+- FFmpeg/ffprobe on PATH
+- GStreamer for proxy/advanced decode paths (recommended on all platforms; required for some proxies)
+  - macOS (Homebrew): `brew install ffmpeg gstreamer gst-plugins-base gst-plugins-good gst-plugins-bad gst-libav`
+  - Ubuntu/Debian: `sudo apt-get install -y ffmpeg gstreamer1.0-libav gstreamer1.0-plugins-{base,good,bad} gstreamer1.0-tools`
+  - Windows: install a recent GStreamer build (system PATH), FFmpeg
+ - ComfyUI (local, optional): required if you want to open the embedded WebView or auto‑import its outputs. Install and run ComfyUI locally (default at http://127.0.0.1:8188). See https://github.com/comfyanonymous/ComfyUI
 
-- To prioritize VideoToolbox decoders ahead of libav, set `GST_PLUGIN_FEATURE_RANK` before launching the desktop app, for example `export GST_PLUGIN_FEATURE_RANK="vtdec_h264:PRIMARY+1,vtdec_hevc:PRIMARY+1"`.
-- Set `GST_DECODER_DIAG=1` to emit a one-time log listing available decoder elements and their current rank—useful when debugging hardware vs. software selection.
-
-## Stack and exact versions
-
-Rust workspace (see Cargo.toml):
-- egui = 0.29
-- eframe = 0.29 (wgpu feature)
-- wgpu = 0.20
-- symphonia = 0.5
-- crossbeam‑channel = 0.5
-- walkdir = 2
-- ureq = 2
-- tungstenite = 0.21
-- url = 2, urlencoding = 2
-- native‑decoder (local crate; gstreamer feature)
-
-External tools:
-- FFmpeg/ffprobe (system) — required for import/metadata
-
-Modal scaffold (Python):
-- Python 3.10+
-- modal, boto3, requests, Pillow (see modal_app/requirements.txt)
-- Base images: nvidia/cuda:12.1.1‑runtime‑ubuntu22.04
-
-## How to run (desktop)
-
-Prereqs:
-- Install Rust (stable) and FFmpeg/ffprobe on PATH
-
-Build & run:
+Desktop app
 ```bash
-cargo build
 cargo run --bin desktop
 ```
 
-Quick tour:
-- Assets → Import… to add media
-- ComfyUI (local): set Repo Path (folder with main.py) and enable Auto‑import if you want local outputs to be imported automatically
-- Cloud (Modal): always visible; set Base URL and API Key, choose Target (ComfyUI /prompt or Workflow (auto‑convert)), paste JSON payload, Test Connection, Queue Job
-- Live job monitor: toggle per Cloud section (cloud WS) and in ComfyUI header (local WS). The app auto‑imports artifacts on job completion
-
-Default behavior:
-- ComfyUI “Open inside editor” is OFF by default
-- New projects create 3 video + 3 audio baseline tracks (V1..V3, A1..A3)
-
-## Package the desktop app
-
-We bundle the native `desktop` binary with [`cargo-bundle`](https://github.com/burtonageo/cargo-bundle). Install the CLI once (`cargo install cargo-bundle`), run a release build, then package per platform (macOS `.app`, Windows `.exe`, Linux `.deb`/AppImage). Detailed steps live in [docs/packaging.md](docs/packaging.md).
-
-## How to run (Modal scaffold)
-
+CLI (headless)
 ```bash
-# from repo root
-pip install -r modal_app/requirements.txt  # for local tooling
-
-# (one‑time) create Modal secret if you aren’t using IAM
-modal secret create aws-credentials
-
-# deploy the app
-modal deploy modal_app/app.py
-
-# smoke tests
-modal run modal_app.app::health
-modal run modal_app.app::generate_frames --job-id test123 --bucket your-bucket
-modal run modal_app.app::encode_video --job-id test123 --bucket your-bucket --codec h264_nvenc
+# Show commands
+cargo run -p cli -- --help
 ```
 
-Notes:
-- encode_video requires an NVENC‑capable GPU (L4/T4/A10G/RTX) and an FFmpeg build with NVENC enabled. The Dockerfile is a scaffold—replace with your NVENC build.
-- generate_frames currently draws synthetic frames. Replace with a ComfyUI runner that writes real frames.
+<!-- Relay section removed: cloud connections not available yet. -->
 
-## Recent decisions (changelog‑lite)
+## 🧩 Architecture
 
-- Tracks: default to 3 video + 3 audio; name V1..V3, A1..A3
-- Local ComfyUI auto‑import: supports images + videos; true move semantics; project routing fixed; base‑path self‑heal when set to a file
-- Local watcher starts when repo_path/output exists; no need to run ComfyUI embed
-- Cloud section: always visible (decoupled from local embed)
-- Scrolling fix: payload editor and logs now have explicit id_source to avoid egui ID collisions
-- Cloud queue: POSTs to /prompt; error bodies surfaced on non‑2xx
-- Cloud target: Prompt vs Workflow (auto‑wrap / best‑effort convert)
-- Live monitors: local WS (/ws) and cloud WS (/events) implemented; non‑blocking stop on toggle
-- Default “Open inside editor” unchecked
+- apps/desktop (egui + wgpu)
+  - Timeline, assets, GPU preview, audio engine, export
+  - ComfyUI integration (local only): optional embedded WebView and auto‑import
+- apps/comfywebview
+  - Minimal native WebView window for ComfyUI
+- crates/*
+  - timeline — graph, tracks, commands
+  - project — SQLite DB, migrations, asset/proxy/job tables
+  - media-io — probe/export helpers, waveforms, encoders
+  - renderer — WGPU renderer and WGSL shaders
+  - exporters — FCPXML/FCP7/EDL/JSON
+  - plugin-host — WASM/Python stubs
+  - native-decoder — VideoToolbox (macOS) + optional GStreamer backend
+  - cli — import/export/convert/analyze/new/encoders
 
-## Troubleshooting
+<details>
+  <summary>Project Structure (click to expand)</summary>
 
-- Nothing imports from ComfyUI: ensure repo_path is saved and output dir exists; ffprobe installed; check Auto‑import Logs
-- Cloud job 404 on queue: Base URL points to raw ComfyUI (/prompt), not /jobs; selector should be “ComfyUI /prompt”
-- 400 on /prompt: JSON must be a ComfyUI API prompt (wrap as {"prompt": {…}, "client_id": "…"}) or use Workflow target
-- NVENC errors in cloud encode on H100: H100 has no NVENC; use L4 for encode or fallback to libx264
+<pre><code>apps/
+  desktop/          # egui UI, preview, decode, export
+  comfywebview/     # lightweight native WebView for ComfyUI
 
-    parameters = context['parameters']
+crates/
+  timeline/         # timeline data structures and commands
+  project/          # SQLite DB + migrations
+  media-io/         # probe, waveforms, proxy helpers
+  renderer/         # WGPU renderer & shaders (WGSL)
+  exporters/        # FCPXML/FCP7/EDL/JSON exporters
+  plugin-host/      # plugin runtime stubs (WASM/Python)
+  native-decoder/   # VideoToolbox & GStreamer backend
+  cli/              # headless commands
 
-    # Your processing logic here
+formats/            # JSON specs (screenplay/storyboard)
+</code></pre>
+</details>
 
-    return {
-        "success": True,
-        "output_items": [],
-        "logs": ["Plugin executed successfully"]
-    }
-```
+## 🖥 Desktop App
 
-### Testing
-
+Build & run
 ```bash
-# Run all tests
-cargo test
-
-# Test specific crate
-cargo test --package timeline
-
-# Run with verbose output
-cargo test -- --nocapture
+cargo run --bin desktop
 ```
 
-## 📋 Current Status
+Optional features
+- Embedded WebView (macOS only): `cargo run --bin desktop --features embed-webview`
+  - Requires a local ComfyUI installation running (default http://127.0.0.1:8188)
+  - In the app, set the ComfyUI Repo Path (folder containing `main.py`) to enable local integrations
 
-### ✅ Implemented
+Basic flow
+- Import media in Assets panel (drag drop or “Import path” + Add)
+- Timeline: click to seek, drag to move/trim, snapping to seconds/edges
+- Export: choose preset; FCPXML/FCP7/EDL/JSON also available
+- ComfyUI (local): set Repo Path, enable auto‑import to ingest outputs
+  - Note: only local ComfyUI is supported at this time; no remote/cloud connection
 
-- ✅ Core timeline and project management
-- ✅ GPU-accelerated preview and rendering
-- ✅ Audio playback and synchronization
-- ✅ Asset management with metadata
-- ✅ FCPXML/FCP7/EDL export/import
-- ✅ Plugin system with WASM and Python support
-- ✅ Hardware encoder detection
-- ✅ Command-line interface
-- ✅ Cross-platform desktop application
+## 🛠 CLI
 
-### 🚧 In Progress / Future Features
+Examples
+```bash
+# Analyze media and print JSON
+cargo run -p cli -- analyze ./media/clip.mp4 --waveforms
 
-- Advanced color grading and LUT support
-- Cloud rendering service integration
-- Advanced effects and transitions
-- Multi-window workspace
-- Collaborative editing features
-- Marketplace for plugins and templates
+# List hardware encoders
+cargo run -p cli -- encoders
 
-## 🎮 Controls
+# Convert to FCPXML/EDL/JSON (demo sequence)
+cargo run -p cli -- convert in.edl out.fcpxml --output-format fcpxml
+```
 
-### Desktop Application
+See all commands
+```bash
+cargo run -p cli -- --help
+```
 
-- **Space**: Play/Pause
-- **Mouse**: Click timeline to seek, drag clips to move/trim
-- **Zoom**: Use zoom slider or "Fit" button to adjust timeline view
-- **Import**: Drag files to import path field or use Import button
-- **Export**: Use Export button for various output formats
+<!-- Relay (cloud) docs removed for now. -->
 
-### Timeline Editing
+## 🎞 Proxy Encoding
 
-- **Click clip**: Select
-- **Drag center**: Move clip
-- **Drag edges**: Trim start/end
-- **Snapping**: Automatic snapping to seconds and clip edges
+Cross‑platform GStreamer pipeline with hardware profiles:
+- macOS: VideoToolbox ProRes (`vtdec(_hw)` + `vtenc_prores`)
+- NVIDIA: NVENC (`nvh264enc`, `nvvidconv`)
+- Intel: VAAPI (`vah264enc`, `vapostproc`)
+- Fallback: DNxHR (software)
 
-## 🛠️ Requirements
+macOS GStreamer (Homebrew) env (used by the app)
+```bash
+export GST_PLUGIN_PATH=/opt/homebrew/lib/gstreamer-1.0
+export GST_PLUGIN_SYSTEM_PATH=/opt/homebrew/lib/gstreamer-1.0
+export GST_PLUGIN_SCANNER=/opt/homebrew/libexec/gstreamer-1.0/gst-plugin-scanner
+export GST_REGISTRY_REUSE_PLUGIN_SCANNER=no
+```
 
-### Minimum System Requirements
+## 🧪 Decoder & GStreamer Notes
 
-- **OS**: macOS 10.15+, Windows 10+, or Linux with OpenGL 3.3+
-- **RAM**: 8 GB minimum, 16 GB recommended
-- **GPU**: Any GPU with wgpu support (most modern GPUs)
-- **Storage**: 2 GB free space for application and cache
+- Prefer VideoToolbox on macOS; use GStreamer elsewhere (or as a macOS option)
+- To force VT over libav in GStreamer, set:
+```bash
+export GST_PLUGIN_FEATURE_RANK="vtdec_h264:PRIMARY+1,vtdec_hevc:PRIMARY+1"
+```
+- One-time diagnostics:
+```bash
+export GST_DECODER_DIAG=1
+```
 
-### Recommended for Best Performance
+## 🗺 Roadmap (Upcoming)
 
-- **RAM**: 32 GB or more for 4K editing
-- **GPU**: Dedicated GPU with 4+ GB VRAM
-- **Storage**: SSD for media files and cache
-- **Hardware Encoders**: NVENC (NVIDIA), VideoToolbox (Apple), or QSV (Intel)
+- Timeline polish and UX improvements
+- Automatic LORA creator
+- Advanced color management and LUTs
+- Rich effects and transitions
+- Multi‑window workspace
+- Collaborative editing
+- Plugin marketplace
+
+## 🤝 Contributing
+
+- Ensure `rustfmt`/`clippy` are green
+- Keep changes focused; update docs as needed
+- File issues with repro steps and logs
+
+---
+
+<p align="center">
+  <sub>Built with Rust, egui, wgpu, GStreamer, and lots of 🧪.</sub>
+</p>
+
+
 
 ## 📄 License
 
 - **Core**: MPL-2.0 (Mozilla Public License 2.0)
-- **Pro Features**: Separate commercial license for advanced codecs and cloud features
+- **Pro Features**: Separate commercial license for advanced codecs and pro features
 
 ## 🤝 Contributing
 
@@ -241,6 +239,8 @@ cargo test -- --nocapture
 ## 📞 Support
 
 For questions, bug reports, or feature requests, please open an issue on the project repository.
+
+- Join our Discord: https://discord.gg/JfsKWDBXHT
 
 ---
 
