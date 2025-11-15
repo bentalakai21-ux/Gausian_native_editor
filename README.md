@@ -245,3 +245,4 @@ For questions, bug reports, or feature requests, please open an issue on the pro
 ---
 
 **Built with ❤️ in Rust** | **GPU-Accelerated** | **Cross-Platform** | **Open Source**
+
